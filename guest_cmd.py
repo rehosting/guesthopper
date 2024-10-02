@@ -4,7 +4,7 @@ import sys
 from glob import glob
 import json
 
-BUF_SIZE = 4096
+BUF_SIZE = 65536
 
 
 def run_guest(unix_socket, port, command):

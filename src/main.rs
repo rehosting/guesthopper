@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use serde_json;
 
-const BUF_SIZE: usize = 4096;
+const BUF_SIZE: usize = 65536;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CmdResult {
