@@ -47,4 +47,6 @@ for x in target/*/release/guesthopper; do
   fi
 done
 
+cp guest_cmd.py ${OUT}/
+
 tar cvfz guesthopper.tar.gz ${OUT}/
