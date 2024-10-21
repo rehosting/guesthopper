@@ -1,8 +1,8 @@
 import socket
 import argparse
 import sys
-from glob import glob
 import json
+import os
 
 BUF_SIZE = 65536
 
@@ -25,8 +25,6 @@ def run_guest(unix_socket, port, command):
 
         received_json = output.decode('utf-8')
         result = json.loads(received_json)
-
-        # Our contract with the runner is STDOUT_BYTES\nSTDOUT\nSTDERR_BYTES\nSTDERR
 
         print(result["stdout"], end='')
         # Propagate stderr to stderr
@@ -66,7 +64,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.socket is None:
-        unix_socket = glob("/tmp/*/vsocket")[0]
+        for root, dirs, files in os.walk('/tmp'):
+            for file in files:
+                if 'vsocket' in file:
+                    unix_socket = os.path.join(root, file)
+                    break
     else:
         unix_socket = args.socket
 
