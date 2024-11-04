@@ -7,7 +7,7 @@ import os
 BUF_SIZE = 65536
 
 
-def run_guest(unix_socket, port, command):
+def run_guest(unix_socket, port, command, use_stdio=True):
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(unix_socket)
@@ -26,6 +26,8 @@ def run_guest(unix_socket, port, command):
         received_json = output.decode('utf-8')
         result = json.loads(received_json)
 
+        if not use_stdio:
+            return result["stdout"]
         print(result["stdout"], end='')
         # Propagate stderr to stderr
         if result["stderr"]:
