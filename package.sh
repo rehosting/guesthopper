@@ -44,6 +44,8 @@ for x in target/*/release/guesthopper; do
   cp $x ${OUT}/guesthopper.${SUFFIX}
   if [ "$SUFFIX" == "mipseb" ]; then
     cp $x ${OUT}/guesthopper.mips64eb
+  elif [ "$SUFFIX" == "mipsel" ]; then
+    cp $x ${OUT}/guesthopper.mips64el
   fi
 done
 
