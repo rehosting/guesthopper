@@ -4,8 +4,6 @@ import sys
 import json
 import os
 
-BUF_SIZE = 65536
-
 
 def run_guest(unix_socket, port, command, use_stdio=True):
     try:
@@ -20,8 +18,12 @@ def run_guest(unix_socket, port, command, use_stdio=True):
 
         s.sendall(command.encode('utf-8'))
 
-        # Receive and parse the response
-        output = s.recv(BUF_SIZE)
+        output = b""
+        while True:
+          chunk = s.recv(4096)  # Read in chunks of 4KB
+          if not chunk:
+            break  # End of stream
+          output += chunk
 
         received_json = output.decode('utf-8')
         result = json.loads(received_json)

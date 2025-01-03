@@ -110,7 +110,6 @@ async fn process_request(mut vsock: VsockStream, addr: VsockAddr, shell: Arc<Str
     };
 
     let serialized = serde_json::to_string(&result)?;
-    assert!(serialized.len() <= BUF_SIZE);
 
     vsock.write_all(serialized.as_bytes()).await?;
     vsock.shutdown(std::net::Shutdown::Both)?;
