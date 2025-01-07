@@ -81,6 +81,16 @@ async fn process_request(mut vsock: VsockStream, addr: VsockAddr, shell: Arc<Str
     let mut exit_code = 0;
 
     if let Some((program, args)) = shlex::split(&shell).unwrap().split_first() {
+        info!("Running command in program '{}' with args '{}'", program, args.join(" "));
+
+        //If our program isn't a shell, let's run the shell (this is for busybox)
+        let args: Vec<String> = if program.ends_with("sh") {
+            args.to_vec()
+        } else {
+            //Probably a better way to do this
+            std::iter::once("sh".to_string()).chain(args.iter().cloned()).collect()
+        };
+
         let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())

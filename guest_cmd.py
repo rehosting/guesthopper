@@ -9,6 +9,7 @@ def run_guest(unix_socket, port, command, use_stdio=True):
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(unix_socket)
+        s.settimeout(30) # Since we do a `while True` later
 
         # Send CONNECT PORTNUM (for vsock) followed by the actual command
         connect_command = f"CONNECT {port}\n"
