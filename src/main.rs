@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shell = Arc::new(args.shell.unwrap_or_else(
         || match std::fs::read_link("/igloo/utils/sh.orig")  {
             Ok(resolved_path) => resolved_path.to_str().unwrap().to_string(),
-            Err(_) => "/bin/busybox sh".to_string()
+            Err(_) => "/bin/busybox".to_string()
         }
     ));
 
