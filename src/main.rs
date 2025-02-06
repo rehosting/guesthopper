@@ -41,14 +41,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ListenAddress::from_args();
     let cid = args.cid.unwrap_or(libc::VMADDR_CID_ANY);
     let addr = VsockAddr::new(cid, args.port);
-    let mut listener = VsockListener::bind(addr)?;
+    let listener = VsockListener::bind(addr)?;
 
     warn!("Listening on VSOCK cid: {}, port: {}", cid, args.port);
 
     let shell = Arc::new(args.shell.unwrap_or_else(
         || match std::fs::read_link("/igloo/utils/sh.orig")  {
             Ok(resolved_path) => resolved_path.to_str().unwrap().to_string(),
-            Err(_) => "/bin/busybox".to_string()
+            Err(_) => "/bin/sh".to_string()
         }
     ));
 
@@ -81,17 +81,13 @@ async fn process_request(mut vsock: VsockStream, addr: VsockAddr, shell: Arc<Str
     let mut exit_code = 0;
 
     if let Some((program, args)) = shlex::split(&shell).unwrap().split_first() {
-        info!("Running command in program '{}' with args '{}'", program, args.join(" "));
-
         //If our program isn't a shell, let's run the shell (this is for busybox)
-        let args: Vec<String> = if program.ends_with("sh") {
-            args.to_vec()
-        } else {
-            //Probably a better way to do this
-            std::iter::once("sh".to_string()).chain(args.iter().cloned()).collect()
-        };
+        let arg0 = if program.ends_with("sh") { program } else { "sh" };
+
+        info!("Running command in program '{}' (argv[0]={}) with args '{}'", program, arg0, args.join(" "));
 
         let mut child = Command::new(program)
+            .arg0(arg0)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
