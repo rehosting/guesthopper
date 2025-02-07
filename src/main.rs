@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ListenAddress::from_args();
     let cid = args.cid.unwrap_or(libc::VMADDR_CID_ANY);
     let addr = VsockAddr::new(cid, args.port);
-    let listener = VsockListener::bind(addr)?;
+    let mut listener = VsockListener::bind(addr)?;
 
     warn!("Listening on VSOCK cid: {}, port: {}", cid, args.port);
 
