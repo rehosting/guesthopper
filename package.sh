@@ -22,7 +22,7 @@ for x in target/*/release/guesthopper; do
   ARCH=$(basename $(dirname $(dirname $x)))
   case $ARCH in
     x86_64-unknown-linux-musl)
-      SUFFIX="x86_64"
+      SUFFIX="intel64" #not my favorite name, but penguin-compatible
       ;;
     arm-unknown-linux-musleabi)
       SUFFIX="armel"
