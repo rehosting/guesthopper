@@ -5,10 +5,15 @@ echo "Building for 5 target arches"
 cargo build --target x86_64-unknown-linux-musl --release
 cargo build --target arm-unknown-linux-musleabi  --release
 rustup target add aarch64-unknown-linux-musl # this shouldn't be necessary, but seems to be
+rustup target add powerpc64-unknown-linux-gnu
+rustup target add loongarch64-unknown-linux-gnu
+rustup target add riscv64gc-unknown-linux-gnu
 cargo build --target aarch64-unknown-linux-musl  --release
 RUSTFLAGS='-C target-feature=+crt-static' cargo build --target mips-unknown-linux-musl --release
 RUSTFLAGS='-C target-feature=+crt-static' cargo build --target mipsel-unknown-linux-musl --release
-
+RUSTFLAGS='-C target-feature=+crt-static -C linker=powerpc64-linux-gnu-gcc' cargo build --target powerpc64-unknown-linux-gnu --release
+RUSTFLAGS='-C target-feature=+crt-static -C linker=loongarch64-unknown-linux-gnu-gcc' cargo build --target loongarch64-unknown-linux-gnu --release
+RUSTFLAGS='-C target-feature=+crt-static -C linker=riscv64-linux-gnu-gcc' cargo build --target riscv64gc-unknown-linux-gnu --release
 
 OUT=guesthopper
 echo "Packaging into ${OUT} and packaging as guesthopper.tar.gz"
@@ -35,6 +40,15 @@ for x in target/*/release/guesthopper; do
       ;;
     mipsel-unknown-linux-musl)
       SUFFIX="mipsel"
+      ;;
+    powerpc64-unknown-linux-gnu)
+      SUFFIX="powerpc64"
+      ;;
+    loongarch64-unknown-linux-gnu)
+      SUFFIX="loongarch64"
+      ;;
+    riscv64gc-unknown-linux-gnu)
+      SUFFIX="riscv64"
       ;;
       *)
       echo "Unsupported architecture: $ARCH"
