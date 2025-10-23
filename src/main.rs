@@ -11,9 +11,11 @@ use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use serde_json;
 use shlex;
+mod portalcall;
 
 const BUF_SIZE: usize = 65536;
 const CMD_TIMEOUT: Duration = Duration::from_secs(10);
+const INDIV_DEBUG_PORTALCALL_MAGIC: u64 = 0xfeedbeef;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CmdResult {
@@ -38,6 +40,13 @@ pub struct ListenAddress {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
+
+    let init_return = portalcall::portal_call1(INDIV_DEBUG_PORTALCALL_MAGIC, 0);
+    if init_return != 0 {
+        error!("Failed to initialize portal call interface, return code {}", init_return);
+        return Err("Failed to initialize portal call interface".into());
+    }
+
     let args = ListenAddress::from_args();
     let cid = args.cid.unwrap_or(libc::VMADDR_CID_ANY);
     let addr = VsockAddr::new(cid, args.port);
