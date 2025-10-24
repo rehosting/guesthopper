@@ -41,11 +41,7 @@ pub struct ListenAddress {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let init_return = portalcall::portal_call1(INDIV_DEBUG_PORTALCALL_MAGIC, 0);
-    if init_return != 0 {
-        warn!("Failed to initialize portal call interface, return code {}", init_return);
-    }
-
+    let _: i64 = portalcall::portal_call1(INDIV_DEBUG_PORTALCALL_MAGIC, 0);
     let args = ListenAddress::from_args();
     let cid = args.cid.unwrap_or(libc::VMADDR_CID_ANY);
     let addr = VsockAddr::new(cid, args.port);
