@@ -13,9 +13,11 @@ use serde_json;
 use shlex;
 mod portalcall;
 
+use portalcall::{URegSize, RegSize};
+
 const BUF_SIZE: usize = 65536;
 const CMD_TIMEOUT: Duration = Duration::from_secs(10);
-const INDIV_DEBUG_PORTALCALL_MAGIC: u64 = 0xfeedbeef;
+const INDIV_DEBUG_PORTALCALL_MAGIC: URegSize = 0xfeedbeef;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CmdResult {
@@ -41,7 +43,7 @@ pub struct ListenAddress {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let _: i64 = portalcall::portal_call1(INDIV_DEBUG_PORTALCALL_MAGIC, 0);
+    let _: RegSize = portalcall::portal_call0(INDIV_DEBUG_PORTALCALL_MAGIC);
     let args = ListenAddress::from_args();
     let cid = args.cid.unwrap_or(libc::VMADDR_CID_ANY);
     let addr = VsockAddr::new(cid, args.port);
