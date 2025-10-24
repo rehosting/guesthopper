@@ -43,8 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let init_return = portalcall::portal_call1(INDIV_DEBUG_PORTALCALL_MAGIC, 0);
     if init_return != 0 {
-        error!("Failed to initialize portal call interface, return code {}", init_return);
-        return Err("Failed to initialize portal call interface".into());
+        warn!("Failed to initialize portal call interface, return code {}", init_return);
     }
 
     let args = ListenAddress::from_args();
