@@ -40,7 +40,6 @@ def run_guest(unix_socket, port, command, use_stdio=True, max_retries=3, retry_d
             if result["stderr"]:
                 print(result["stderr"], file=sys.stderr, end='')
             sys.exit(result["exit_code"])
-            break  # Success, exit loop
 
         except ConnectionResetError as e:
             print(f"Connection reset by peer (attempt {attempt+1}/{max_retries}): {e}", file=sys.stderr)
