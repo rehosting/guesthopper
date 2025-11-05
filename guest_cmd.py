@@ -6,6 +6,7 @@ import os
 
 
 def run_guest(unix_socket, port, command, use_stdio=True):
+    s = None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(unix_socket)
@@ -38,15 +39,13 @@ def run_guest(unix_socket, port, command, use_stdio=True):
         sys.exit(result["exit_code"])
 
     except OSError as e:
-        if s.error:
-            print(f"Socket error: {e}", file=sys.stderr)
-        else:
-            print(e, file=sys.stderr)
+        print(f"Socket error: {e}", file=sys.stderr)
     except SystemExit as e:
         # A little janky, but does the trick
         sys.exit(e.code)
     finally:
-        s.close()
+        if s is not None:
+            s.close()
 
 
 if __name__ == "__main__":
