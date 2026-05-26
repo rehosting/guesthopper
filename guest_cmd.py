@@ -5,6 +5,12 @@ import json
 import os
 
 
+def prepare_command(command):
+    if "PATH=" not in command:
+        command = f"export PATH=/igloo/utils:$PATH; {command}"
+    return command
+
+
 def run_guest(unix_socket, port, command, use_stdio=True):
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -17,7 +23,7 @@ def run_guest(unix_socket, port, command, use_stdio=True):
         response = s.recv(4096).decode('utf-8')
         assert f"OK {port}" in response, "OK not received from vsock unix socket"
 
-        s.sendall(command.encode('utf-8'))
+        s.sendall(prepare_command(command).encode('utf-8'))
 
         output = b""
         while True:

@@ -7,7 +7,9 @@ use structopt::StructOpt;
 use log::{info,warn,error};
 use env_logger;
 use std::error::Error;
+use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use shlex;
@@ -18,6 +20,8 @@ use portalcall::{URegSize, RegSize};
 const BUF_SIZE: usize = 65536;
 const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const INDIV_DEBUG_PORTALCALL_MAGIC: URegSize = 0xfeedbeef;
+const LONG_COMMAND_THRESHOLD: usize = 2048;
+static LONG_COMMAND_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CmdResult {
@@ -81,6 +85,7 @@ async fn process_request(mut vsock: VsockStream, addr: VsockAddr, shell: Arc<Str
 
     let command = command.trim();
     info!("Received command: {}", command);
+    warn_long_command_to_console(command);
 
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -127,4 +132,26 @@ async fn process_request(mut vsock: VsockStream, addr: VsockAddr, shell: Arc<Str
     vsock.shutdown(std::net::Shutdown::Both)?;
 
     Ok(())
+}
+
+fn warn_long_command_to_console(command: &str) {
+    if command.len() < LONG_COMMAND_THRESHOLD {
+        return;
+    }
+    if LONG_COMMAND_WARNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let warning = concat!(
+        "[IGLOO] warning: long guest_cmd detected; consider putting large commands ",
+        "in static_files, init.d, or the shared results directory instead.\n"
+    );
+    match std::fs::OpenOptions::new().write(true).open("/dev/ttyS0") {
+        Ok(mut tty) => {
+            let _ = tty.write_all(warning.as_bytes());
+        }
+        Err(_) => {
+            warn!("{}", warning.trim_end());
+        }
+    }
 }
