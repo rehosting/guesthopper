@@ -7,7 +7,6 @@ use structopt::StructOpt;
 use log::{info,warn,error};
 use env_logger;
 use std::error::Error;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Serialize, Deserialize};
@@ -148,7 +147,7 @@ fn warn_long_command_to_console(command: &str) {
     );
     match std::fs::OpenOptions::new().write(true).open("/dev/ttyS0") {
         Ok(mut tty) => {
-            let _ = tty.write_all(warning.as_bytes());
+            let _ = std::io::Write::write_all(&mut tty, warning.as_bytes());
         }
         Err(_) => {
             warn!("{}", warning.trim_end());
