@@ -13,7 +13,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Test Python client
+        run: python3 -m unittest discover -s tests
+
       - name: Build 
         run: |
           docker run --rm -v $PWD:/app -w /app ghcr.io/rehosting/embedded-toolchains_rust:latest /app/package.sh
-
