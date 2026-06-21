@@ -1,4 +1,9 @@
-name: Compile and Publish guesthopper
+name: Tag and Publish release
+
+# guesthopper is no longer cross-built here -- penguin-tools builds it for every
+# guest arch from this source (github:rehosting/penguin-tools#guesthopper-*) and
+# ships it (with guest_cmd.py) in penguin-tools.tar.gz. This workflow only cuts a
+# versioned release for tracking/provenance; it publishes no binary asset.
 
 on:
   push:
@@ -6,8 +11,8 @@ on:
       - main
 
 jobs:
-  build:
-    runs-on: rehosting-arc
+  release:
+    runs-on: ubuntu-latest
     permissions:
       contents: write
 
@@ -21,16 +26,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build 
-        run: |
-          docker run --rm -v $PWD:/app -w /app rehosting/embedded-toolchains_rust:latest /app/package.sh
-
-      - name: Save package
-        uses: actions/upload-artifact@v4
-        with:
-          name: guesthopper
-          path: guesthopper.tar.gz 
-
       - name: Create release
         id: create_release
         uses: actions/create-release@v1
@@ -41,18 +36,11 @@ jobs:
           release_name: Release ${{ steps.version.outputs.v-version }} ${{ github.ref }}
           body: |
             Release ${{ steps.version.outputs.v-version }} @${{ github.ref }}
+
+            Binaries are built and distributed by penguin-tools
+            (penguin-tools.tar.gz); this release carries no binary asset.
           draft: true
           prerelease: false
-          
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./guesthopper.tar.gz
-          asset_name: guesthopper.tar.gz
-          asset_content_type: application/gzip
 
       - name: Publish release
         uses: StuYarrow/publish-release@v1.1.2

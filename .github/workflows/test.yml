@@ -1,21 +1,55 @@
 name: Check that the code compiles
 
+# Build guesthopper for every guest arch through the penguin-tools Nix cross
+# matrix (the same machinery that ships it in penguin-tools.tar.gz), compiling
+# *this* checkout via --override-input. Replaces the old embedded-toolchains
+# Docker build. The Python host-client unit tests still run here.
+
 on:
   pull_request:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: rehosting-arc
-
+    env:
+      USER: runner
+      LOGNAME: runner
+      TMPDIR: /home/runner/_work/_temp
+      XDG_CACHE_HOME: /home/runner/_work/.cache
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Test Python client
         run: python3 -m unittest discover -s tests
 
-      - name: Build 
+      - name: Prepare runner directories
+        run: mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl jq xz-utils
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            max-jobs = 8
+            cores = 8
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v16
+        with:
+          name: rehosting-tools
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event_name == 'pull_request' }}
+
+      - name: Build guesthopper for all guest arches (this checkout)
         run: |
-          docker run --rm -v $PWD:/app -w /app rehosting/embedded-toolchains_rust:latest /app/package.sh
+          set -eux
+          for a in x86_64 armel aarch64 mipsel mipseb mips64el mips64eb \
+                   powerpc64 powerpc64le riscv64 loongarch64; do
+            nix build --accept-flake-config \
+              "github:rehosting/penguin-tools#guesthopper-$a" \
+              --override-input guesthopper "path:$PWD" \
+              --no-link --print-out-paths -L
+          done
