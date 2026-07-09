@@ -37,6 +37,9 @@ jobs:
       # don't hit the anonymous API rate limit.
       - name: Build guesthopper for all guest arches (this checkout)
         env:
+          # Route store writes through the root-owned multi-user daemon (the
+          # runner user can't write /nix/store directly).
+          NIX_REMOTE: daemon
           NIX_CONFIG: |
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
         run: |
