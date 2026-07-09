@@ -1,9 +1,9 @@
 name: Tag and Publish release
 
-# guesthopper is no longer cross-built here -- penguin-tools builds it for every
-# guest arch from this source (github:rehosting/penguin-tools#guesthopper-*) and
-# ships it (with guest_cmd.py) in penguin-tools.tar.gz. This workflow only cuts a
-# versioned release for tracking/provenance; it publishes no binary asset.
+# This repo builds itself via its own flake (`nix build .#dist`, see test.yml).
+# penguin consumes it as a flake input pinned to the tag this workflow cuts,
+# building the binaries from source at that tag -- so this release is a
+# version/provenance marker and publishes no binary asset.
 
 on:
   push:

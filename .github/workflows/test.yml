@@ -1,9 +1,9 @@
 name: Check that the code compiles
 
-# Build guesthopper for every guest arch through the penguin-tools Nix cross
-# matrix (the same machinery that ships it in penguin-tools.tar.gz), compiling
-# *this* checkout via --override-input. Replaces the old embedded-toolchains
-# Docker build. The Python host-client unit tests still run here.
+# Build guesthopper for every guest arch through this repo's OWN flake
+# (`nix build .#dist` cross-builds all arches into the /igloo_static fragment
+# penguin consumes). Self-contained -- no longer borrows penguin-tools'
+# machinery. The Python host-client unit tests still run here.
 
 on:
   pull_request:
@@ -46,10 +46,4 @@ jobs:
       - name: Build guesthopper for all guest arches (this checkout)
         run: |
           set -eux
-          for a in x86_64 armel aarch64 mipsel mipseb mips64el mips64eb \
-                   powerpc64 powerpc64le riscv64 loongarch64; do
-            nix build --accept-flake-config \
-              "github:rehosting/penguin-tools#guesthopper-$a" \
-              --override-input guesthopper "path:$PWD" \
-              --no-link --print-out-paths -L
-          done
+          nix build --accept-flake-config .#dist --no-link --print-out-paths -L
