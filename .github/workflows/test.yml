@@ -29,8 +29,14 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y curl jq xz-utils
 
+      # Arc self-hosted pods expose /dev/kvm without a working udevd, which
+      # breaks install-nix-action's default KVM setup; and its default Nix
+      # (2.22.1) computes different tarball narHashes than modern Nix. Pin both
+      # (mirrors rehosting/ci's nix-setup + penguin's image build).
       - uses: cachix/install-nix-action@v27
         with:
+          install_url: https://releases.nixos.org/nix/nix-2.31.2/install
+          enable_kvm: false
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: |
             max-jobs = 8
