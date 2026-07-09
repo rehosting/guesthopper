@@ -29,25 +29,23 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y curl jq xz-utils
 
-      # rehosting-arc pods ship a pre-installed multi-user Nix, so
-      # install-nix-action can't re-install over the root-owned /nix store
-      # ("Permission denied"). Use the pre-installed nix directly. The flake's
-      # nixConfig (--accept-flake-config) supplies the rehosting-tools
-      # substituter; NIX_CONFIG carries a GitHub token so flake-input fetches
-      # don't hit the anonymous API rate limit.
+      # Use the org-shared Nix setup (same as penguin's image build): pins a
+      # modern Nix whose hashing matches the flake.lock and disables the KVM
+      # setup that Arc pods lack a working udevd for.
+      - name: Set up Nix
+        uses: rehosting/ci/actions/nix-setup@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          install-url: https://releases.nixos.org/nix/nix-2.31.2/install
+          enable-kvm: false
+          extra-nix-config: |
+            max-jobs = 8
+            cores = 8
+          cache-backend: cachix
+          cachix-name: rehosting-tools
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
       - name: Build guesthopper for all guest arches (this checkout)
-        env:
-          # Route store writes through the root-owned multi-user daemon (the
-          # runner user can't write /nix/store directly).
-          NIX_REMOTE: daemon
-          NIX_CONFIG: |
-            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
-          for p in /nix/var/nix/profiles/default/bin "$HOME/.nix-profile/bin" \
-                   /usr/local/bin /usr/bin; do
-            if [ -x "$p/nix" ]; then export PATH="$p:$PATH"; break; fi
-          done
-          command -v nix || { echo "::error::no pre-installed nix on runner"; exit 1; }
-          nix --version
           nix build --accept-flake-config .#dist --no-link --print-out-paths -L
