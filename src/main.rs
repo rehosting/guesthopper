@@ -50,6 +50,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Running commands with {}", shell);
 
+    // A session with no frame (not even a keepalive PING) for this long is
+    // treated as a dead client and torn down -- the backstop for an abrupt
+    // disconnect the vsock transport doesn't surface as EOF/error. Generous by
+    // default (guest time runs slow under emulation and the client PINGs every
+    // few seconds); override with GUESTHOPPER_IDLE_TIMEOUT_SECS.
+    let idle_timeout = std::time::Duration::from_secs(
+        std::env::var("GUESTHOPPER_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30),
+    );
+    info!("Session idle timeout: {}s", idle_timeout.as_secs());
+
     loop {
         // Accept an incoming connection. The vsock transport already gives one
         // independent stream per CONNECT, so each accepted stream is one
@@ -59,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shell_clone = Arc::clone(&shell);
         tokio::spawn(async move {
             let (reader, writer) = tokio::io::split(vsock);
-            if let Err(e) = run_session(reader, writer, shell_clone).await {
+            if let Err(e) = run_session(reader, writer, shell_clone, idle_timeout).await {
                 error!("Session error from {}: {}", addr, e);
             }
         });

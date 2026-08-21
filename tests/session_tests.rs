@@ -21,7 +21,7 @@ async fn run_exec(cmd: &str, deadline: Option<f64>) -> Collected {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
     let shell = Arc::new("/bin/sh".to_string());
-    let session = tokio::spawn(run_session(g_rd, g_wr, shell));
+    let session = tokio::spawn(run_session(g_rd, g_wr, shell, std::time::Duration::from_secs(60)));
 
     let (mut h_rd, mut h_wr) = split(host);
     let mut req = serde_json::json!({ "verb": "exec", "cmd": cmd });
@@ -101,7 +101,7 @@ async fn stdin_is_forwarded_to_child() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
     let shell = Arc::new("/bin/sh".to_string());
-    let session = tokio::spawn(run_session(g_rd, g_wr, shell));
+    let session = tokio::spawn(run_session(g_rd, g_wr, shell, std::time::Duration::from_secs(60)));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "exec", "cmd": "cat" });
@@ -172,7 +172,7 @@ async fn read_until<R: AsyncRead + Unpin>(r: &mut R, needle: &str) -> String {
 async fn open_pty_runs_interactive_shell_with_a_tty() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
-    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string())));
+    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60)));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "open-pty", "rows": 30, "cols": 100 });
@@ -199,7 +199,7 @@ async fn open_pty_runs_interactive_shell_with_a_tty() {
 async fn open_pty_honors_resize_frame() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
-    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string())));
+    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60)));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "open-pty", "rows": 24, "cols": 80 });
@@ -225,7 +225,7 @@ async fn open_pty_hangs_up_shell_on_disconnect() {
     // the session must terminate (not orphan the shell / hang on wait).
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
-    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string())));
+    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60)));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "open-pty" });
@@ -261,13 +261,38 @@ async fn open_pty_tears_down_on_abrupt_disconnect_via_writer_failure() {
 
     let reader = OnceThenPending { data, pos: 0 };
     let writer = FailingWriter;
-    let session = tokio::spawn(run_session(reader, writer, Arc::new("/bin/sh".to_string())));
+    let session = tokio::spawn(run_session(reader, writer, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60)));
 
     let done = tokio::time::timeout(std::time::Duration::from_secs(8), session).await;
     assert!(
         done.is_ok(),
         "session did not tear down via cancel when the peer's write side died"
     );
+}
+
+#[tokio::test]
+async fn session_times_out_when_client_goes_silent() {
+    // The keepalive backstop: no frame (not even a PING) within idle_timeout
+    // means the client is gone, even when the transport surfaces neither a read
+    // EOF nor a write error. Reader delivers the open-pty request then parks
+    // forever; the writer is a sink that always succeeds (so the write-failure
+    // cancel path can't fire) -- only the idle timeout can end this session.
+    let mut data = Vec::new();
+    let req = serde_json::to_vec(&serde_json::json!({ "verb": "open-pty" })).unwrap();
+    data.push(frame::FRAME_REQUEST);
+    data.extend_from_slice(&(req.len() as u32).to_be_bytes());
+    data.extend_from_slice(&req);
+
+    let reader = OnceThenPending { data, pos: 0 };
+    let session = tokio::spawn(run_session(
+        reader,
+        tokio::io::sink(),
+        Arc::new("/bin/sh".to_string()),
+        std::time::Duration::from_millis(300),
+    ));
+
+    let done = tokio::time::timeout(std::time::Duration::from_secs(8), session).await;
+    assert!(done.is_ok(), "session did not time out a silent (no-ping) client");
 }
 
 /// AsyncRead that returns its buffer once, then parks forever (never EOF) --
@@ -328,7 +353,7 @@ async fn unsupported_verb_reports_error() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
     let shell = Arc::new("/bin/sh".to_string());
-    let session = tokio::spawn(run_session(g_rd, g_wr, shell));
+    let session = tokio::spawn(run_session(g_rd, g_wr, shell, std::time::Duration::from_secs(60)));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "teleport" });
