@@ -1,33 +1,15 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{timeout, Duration};
-use tokio_vsock::{VsockListener,VsockAddr, VsockStream};
-use tokio::process::Command;
-use std::process::Stdio;
+use tokio_vsock::{VsockListener, VsockAddr};
 use structopt::StructOpt;
-use log::{info,warn,error};
+use log::{info, warn, error};
 use env_logger;
-use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use serde::{Serialize, Deserialize};
-use serde_json;
-use shlex;
-mod portalcall;
 
+use guesthopper::session::run_session;
+
+mod portalcall;
 use portalcall::{URegSize, RegSize};
 
-const BUF_SIZE: usize = 65536;
-const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const INDIV_DEBUG_PORTALCALL_MAGIC: URegSize = 0xfeedbeef;
-const LONG_COMMAND_THRESHOLD: usize = 2048;
-static LONG_COMMAND_WARNED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Serialize, Deserialize, Debug)]
-struct CmdResult {
-    stdout: String,
-    stderr: String,
-    exit_code: i32,
-}
 
 #[derive(Clone, StructOpt)]
 pub struct ListenAddress {
@@ -42,7 +24,12 @@ pub struct ListenAddress {
     shell: Option<String>,
 }
 
-#[tokio::main]
+// A current-thread runtime: the guest is typically one emulated vCPU, so a
+// multi-threaded work-stealing scheduler is pure emulated overhead (worker
+// threads, cross-thread wakeups). tokio::spawn still works -- tasks are
+// cooperatively scheduled on the single thread. Keeps guest CPU near zero when
+// idle (blocked on accept/epoll) and lean under load.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
@@ -50,107 +37,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ListenAddress::from_args();
     let cid = args.cid.unwrap_or(libc::VMADDR_CID_ANY);
     let addr = VsockAddr::new(cid, args.port);
-    let mut listener = VsockListener::bind(addr)?;
+    let listener = VsockListener::bind(addr)?;
 
     warn!("Listening on VSOCK cid: {}, port: {}", cid, args.port);
 
     let shell = Arc::new(args.shell.unwrap_or_else(
-        || match std::fs::read_link("/igloo/utils/sh.orig")  {
+        || match std::fs::read_link("/igloo/utils/sh.orig") {
             Ok(resolved_path) => resolved_path.to_str().unwrap().to_string(),
-            Err(_) => "/bin/sh".to_string()
-        }
+            Err(_) => "/bin/sh".to_string(),
+        },
     ));
 
     info!("Running commands with {}", shell);
 
     loop {
-        // Accept an incoming connection
+        // Accept an incoming connection. The vsock transport already gives one
+        // independent stream per CONNECT, so each accepted stream is one
+        // session -- we split it into read/write halves and hand it off.
         let (vsock, addr) = listener.accept().await?;
+        info!("Received connection from {}", addr);
         let shell_clone = Arc::clone(&shell);
-        tokio::spawn(async move { 
-            if let Err(e) = process_request(vsock, addr, shell_clone).await {
-                error!("Error: {}", e);
+        tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(vsock);
+            if let Err(e) = run_session(reader, writer, shell_clone).await {
+                error!("Session error from {}: {}", addr, e);
             }
         });
-    }
-}
-
-async fn process_request(mut vsock: VsockStream, addr: VsockAddr, shell: Arc<String>) -> Result<(), Box<dyn Error>> {
-    info!("Received connection from {}",addr);
-
-    let mut buffer = [0; BUF_SIZE];
-    let n = vsock.read(&mut buffer).await?;
-    let command = String::from_utf8_lossy(&buffer[..n]);
-
-    let command = command.trim();
-    info!("Received command: {}", command);
-    warn_long_command_to_console(command);
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    let mut exit_code = 0;
-
-    if let Some((program, args)) = shlex::split(&shell).unwrap().split_first() {
-        //If our program isn't a shell, let's run the shell (this is for busybox)
-        let arg0 = if program.ends_with("sh") { program } else { "sh" };
-
-        info!("Running command in program '{}' (argv[0]={}) with args '{}'", program, arg0, args.join(" "));
-
-        let mut child = Command::new(program)
-            .arg0(arg0)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()) // Could Stdio::inherit() if we wanted to combine streams
-            .spawn()?;
-
-        let _ = timeout(CMD_TIMEOUT, async {
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(&format!("{}\n", command).into_bytes())
-                .await.unwrap();
-                stdin.write_all(b"exit $?\n")
-                .await.unwrap();
-            }
-
-            let status = child.wait().await.unwrap();
-            exit_code = status.code().unwrap();
-            child.stdout.unwrap().read_to_string(&mut stdout).await.unwrap();
-            child.stderr.unwrap().read_to_string(&mut stderr).await.unwrap();
-        }).await;
-    }
-
-    let result = CmdResult {
-        stdout: stdout,
-        stderr: stderr,
-        exit_code: exit_code
-    };
-
-    let serialized = serde_json::to_string(&result)?;
-
-    vsock.write_all(serialized.as_bytes()).await?;
-    vsock.shutdown(std::net::Shutdown::Both)?;
-
-    Ok(())
-}
-
-fn warn_long_command_to_console(command: &str) {
-    if command.len() < LONG_COMMAND_THRESHOLD {
-        return;
-    }
-    if LONG_COMMAND_WARNED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let warning = concat!(
-        "[IGLOO] warning: long guest_cmd detected; consider putting large commands ",
-        "in static_files, init.d, or the shared results directory instead.\n"
-    );
-    match std::fs::OpenOptions::new().write(true).open("/dev/ttyS0") {
-        Ok(mut tty) => {
-            let _ = std::io::Write::write_all(&mut tty, warning.as_bytes());
-        }
-        Err(_) => {
-            warn!("{}", warning.trim_end());
-        }
     }
 }
