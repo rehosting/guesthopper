@@ -12,6 +12,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const FRAME_REQUEST: u8 = 1;
 pub const FRAME_STDIN: u8 = 2;
 pub const FRAME_STDIN_EOF: u8 = 3;
+/// Client->agent liveness keepalive. Carries no payload and needs no reply: the
+/// agent treats *any* received frame as proof the client is alive, so a PING
+/// arriving on an otherwise-idle session just resets the read deadline. Lets the
+/// agent detect an abrupt client death that the vsock transport does not surface
+/// as a read EOF or a write error.
+pub const FRAME_PING: u8 = 4;
 // SIGNAL=4 reserved for a later slice.
 pub const FRAME_RESIZE: u8 = 5; // pty window size {rows, cols}
 

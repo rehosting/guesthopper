@@ -64,6 +64,7 @@ pub async fn run_session<R, W>(
     mut reader: R,
     writer: W,
     shell: Arc<String>,
+    idle_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -94,7 +95,12 @@ where
         }
     });
 
-    let result = drive(&mut reader, &tx, shell, cancel).await;
+    // A second liveness net for the case `cancel` can't catch: an abrupt client
+    // death that the vsock transport surfaces as neither a read EOF nor a write
+    // error (the guest write just backpressures). The input readers below bound
+    // each read by `idle_timeout`; a live client keeps the deadline fresh by
+    // sending FRAME_PING on idle, so a lapse means the peer is gone -> tear down.
+    let result = drive(&mut reader, &tx, shell, cancel, idle_timeout).await;
     if let Err(e) = &result {
         send_error(&tx, &format!("session error: {e}"));
     }
@@ -108,6 +114,7 @@ async fn drive<R>(
     tx: &Tx,
     shell: Arc<String>,
     cancel: Arc<tokio::sync::Notify>,
+    idle_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -130,8 +137,8 @@ where
     };
 
     match req.verb.as_str() {
-        "exec" => exec(reader, tx, &shell, req, &cancel).await,
-        "open-pty" => open_pty(reader, tx, &shell, req, &cancel).await,
+        "exec" => exec(reader, tx, &shell, req, &cancel, idle_timeout).await,
+        "open-pty" => open_pty(reader, tx, &shell, req, &cancel, idle_timeout).await,
         other => {
             send_error(tx, &format!("unsupported verb: {other:?}"));
             Ok(())
@@ -145,6 +152,7 @@ async fn exec<R>(
     shell: &str,
     req: Request,
     cancel: &tokio::sync::Notify,
+    idle_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -202,20 +210,27 @@ where
         let mut cstdin = cstdin;
         async move {
             loop {
-                match frame::read_frame(reader).await {
-                    Ok(Some(f)) if f.ftype == frame::FRAME_STDIN => {
+                // Bound each read by idle_timeout. A live client keeps this fresh
+                // with FRAME_PING on idle; a lapse means the peer is gone, so fire
+                // cancel (the select below is biased to kill the child on it).
+                match timeout(idle_timeout, frame::read_frame(reader)).await {
+                    Err(_elapsed) => {
+                        cancel.notify_one();
+                        break;
+                    }
+                    Ok(Ok(Some(f))) if f.ftype == frame::FRAME_STDIN => {
                         if let Some(si) = cstdin.as_mut() {
                             if si.write_all(&f.payload).await.is_err() {
                                 break;
                             }
                         }
                     }
-                    Ok(Some(f)) if f.ftype == frame::FRAME_STDIN_EOF => {
+                    Ok(Ok(Some(f))) if f.ftype == frame::FRAME_STDIN_EOF => {
                         cstdin = None; // drop -> close child's stdin
                     }
-                    Ok(Some(_)) => {} // ignore unknown frames in slice 1
-                    Ok(None) => break, // host closed its write half
-                    Err(_) => break,
+                    Ok(Ok(Some(_))) => {} // PING / unknown frames: just liveness
+                    Ok(Ok(None)) => break, // host closed its write half
+                    Ok(Err(_)) => break,
                 }
             }
         }
@@ -246,21 +261,25 @@ where
         tokio::pin!(wait);
         loop {
             tokio::select! {
-                _ = &mut stdin_task => {
-                    // stdin drained/closed; keep waiting for the child.
+                // Biased so that when a stdin-idle lapse fires `cancel` and ends
+                // stdin_task in the same poll, the kill wins over "keep waiting".
+                biased;
+                _ = cancel.notified() => {
+                    // The peer is gone (writer failed, or no frame within
+                    // idle_timeout). Don't keep the command running against a
+                    // dead client -- kill it, then reap via the existing `wait`
+                    // future (which owns the &mut child borrow).
+                    if let Some(pid) = child_pid {
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    }
                     let status = (&mut wait).await;
                     break status.ok().and_then(|s| s.code()).unwrap_or(-1);
                 }
                 status = &mut wait => {
                     break status.ok().and_then(|s| s.code()).unwrap_or(-1);
                 }
-                _ = cancel.notified() => {
-                    // The peer is gone (writer failed). Don't keep the command
-                    // running against a dead client -- kill it, then reap via the
-                    // existing `wait` future (which owns the &mut child borrow).
-                    if let Some(pid) = child_pid {
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                    }
+                _ = &mut stdin_task => {
+                    // stdin drained/closed cleanly; keep waiting for the child.
                     let status = (&mut wait).await;
                     break status.ok().and_then(|s| s.code()).unwrap_or(-1);
                 }
@@ -300,6 +319,7 @@ async fn open_pty<R>(
     shell: &str,
     req: Request,
     cancel: &tokio::sync::Notify,
+    idle_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -410,20 +430,28 @@ where
     let am_write = Arc::clone(&am);
     let input_task = async move {
         loop {
-            match frame::read_frame(reader).await {
-                Ok(Some(f)) if f.ftype == frame::FRAME_STDIN => {
+            // Bound each read by idle_timeout; a live client keeps it fresh with
+            // FRAME_PING on idle. A lapse means the peer is gone (a state the
+            // vsock transport may not surface as EOF), so fire cancel and stop --
+            // the select below hangs up the shell either way.
+            match timeout(idle_timeout, frame::read_frame(reader)).await {
+                Err(_elapsed) => {
+                    cancel.notify_one();
+                    break;
+                }
+                Ok(Ok(Some(f))) if f.ftype == frame::FRAME_STDIN => {
                     if write_all_fd(&am_write, &f.payload).await.is_err() {
                         break;
                     }
                 }
-                Ok(Some(f)) if f.ftype == frame::FRAME_RESIZE => {
+                Ok(Ok(Some(f))) if f.ftype == frame::FRAME_RESIZE => {
                     if let Ok(r) = serde_json::from_slice::<Resize>(&f.payload) {
                         set_winsize(am_write.get_ref().as_raw_fd(), r.rows, r.cols);
                     }
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(Ok(Some(_))) => {} // PING / unknown frames: just liveness
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) => break,
             }
         }
     };

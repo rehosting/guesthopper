@@ -14,6 +14,7 @@ class GuestCommandError(RuntimeError):
 FRAME_REQUEST = 1
 FRAME_STDIN = 2
 FRAME_STDIN_EOF = 3
+FRAME_PING = 4  # client->agent liveness keepalive (no payload, no reply)
 FRAME_RESIZE = 5
 FRAME_STDOUT = 16
 FRAME_STDERR = 17
@@ -21,6 +22,10 @@ FRAME_EXIT = 18
 FRAME_ERROR = 19
 
 MAX_FRAME_LEN = 16 * 1024 * 1024
+
+# Send a keepalive PING after this many idle seconds so the agent's idle-timeout
+# (default 30s) never trips on a live-but-quiet session. Well under that budget.
+PING_INTERVAL_S = 5
 
 
 def prepare_command(command):
@@ -140,11 +145,24 @@ def run_guest_with_socket(sock, port, command):
 
 def _collect_result(sock):
     """Drain frames until EXIT, returning the legacy {stdout,stderr,exit_code} dict."""
+    import select
+
     stdout = bytearray()
     stderr = bytearray()
     exit_code = None
 
     while True:
+        # Keep the session alive on the agent side during a long, quiet command:
+        # send a PING whenever no output has arrived for PING_INTERVAL_S. A
+        # socket without a real fileno (e.g. an in-memory test fake) can't be
+        # polled -- fall back to a plain blocking read (no keepalive needed).
+        try:
+            readable, _, _ = select.select([sock], [], [], PING_INTERVAL_S)
+        except (TypeError, OSError, ValueError):
+            readable = True
+        if not readable:
+            write_frame(sock, FRAME_PING)
+            continue
         frame = read_frame(sock)
         if frame is None:
             break
@@ -260,7 +278,12 @@ def run_shell(unix_socket, port):
                 # frame to us (lost exit code + spurious "connection reset").
                 watch = [stdin_fd, sock_fd]
                 while True:
-                    readable, _, _ = select.select(watch, [], [])
+                    readable, _, _ = select.select(watch, [], [], PING_INTERVAL_S)
+                    if not readable:
+                        # Idle: keepalive so the agent doesn't time the session
+                        # out while the user is just sitting at the prompt.
+                        write_frame(sock, FRAME_PING)
+                        continue
                     if stdin_fd in readable:
                         data = os.read(stdin_fd, 4096)
                         if not data:
