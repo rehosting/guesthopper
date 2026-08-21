@@ -13,7 +13,26 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 structopt = "0"
 thiserror = "1"
+# We only use rt/macros/io-util/net/process/sync/time, but keep the "full"
+# feature set: narrowing forces cargo to re-resolve the lock, and the pinned
+# embedded-toolchains_rust image (rustc 1.71) then pulls newer transitive crates
+# that need a newer rustc. "full" keeps the committed (known-good) lock valid;
+# unused tokio machinery (multi-thread rt, etc.) is dropped by LTO anyway.
 tokio = { version = "1", features = ["full"] }
 tokio-vsock = "0"
 shlex = "*"
 #don't forgot .cargo/config for linker configs!
+
+# The agent is staged into the guest and resident there; guest RAM is limited
+# and page faults are emulated, so optimize the release build for size.
+[profile.release]
+# The agent is a thin I/O conduit that barely computes, so opt-level has little
+# effect on its (negligible) guest CPU. Use "s" for a compact resident binary
+# without "z"'s inlining suppression, which can *raise* the executed-instruction
+# count that actually matters under emulation. Keep unwind (not panic="abort")
+# so a panic in one spawned session task is contained rather than taking the
+# whole agent (and, later, the console) down with it.
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
