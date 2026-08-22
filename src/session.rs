@@ -216,7 +216,17 @@ async fn drive<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let req = match frame::read_frame(reader).await? {
+    // Bound the initial REQUEST read the same way the verb loops bound theirs.
+    // Without this a client that CONNECTs and then sends nothing -- or dribbles
+    // a partial header and stalls -- parks the session forever: `cancel` is only
+    // armed once a verb handler runs, so nothing tears it down, and the stream +
+    // writer task leak. A zero-cost slowloris. Give up if no REQUEST arrives in
+    // time.
+    let first = match timeout(idle_timeout, frame::read_frame(reader)).await {
+        Err(_elapsed) => return Ok(()),
+        Ok(r) => r?,
+    };
+    let req = match first {
         Some(f) if f.ftype == frame::FRAME_REQUEST => {
             match serde_json::from_slice::<Request>(&f.payload) {
                 Ok(r) => r,
@@ -517,9 +527,28 @@ where
     // report EOF/EIO once the child's copies are gone.
     unsafe { libc::close(slave) };
 
-    set_nonblocking(master)?;
-    // SAFETY: master is a live, now-owned fd.
-    let am = Arc::new(AsyncFd::new(unsafe { OwnedFd::from_raw_fd(master) })?);
+    // These two failures happen *after* the shell is spawned and the slave
+    // closed, so a bare `?` would leak the master fd and orphan the running
+    // shell. Kill the child's group, reap it, and (for the non-blocking case,
+    // where master is still a raw fd) close master before bailing.
+    if let Err(e) = set_nonblocking(master) {
+        kill_group(child.id());
+        let _ = child.wait().await;
+        unsafe { libc::close(master) };
+        send_error(tx, &format!("failed to set pty master non-blocking: {e}")).await;
+        return Ok(());
+    }
+    // SAFETY: master is a live, now-owned fd. On AsyncFd::new failure the moved
+    // OwnedFd is dropped, which closes master -- so we must not close it again.
+    let am = match AsyncFd::new(unsafe { OwnedFd::from_raw_fd(master) }) {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            kill_group(child.id());
+            let _ = child.wait().await;
+            send_error(tx, &format!("failed to register pty master with the runtime: {e}")).await;
+            return Ok(());
+        }
+    };
 
     // Pty master -> STDOUT frames.
     let tx_out = tx.clone();
@@ -675,6 +704,16 @@ async fn write_all_fd(am: &AsyncFd<OwnedFd>, data: &[u8]) -> std::io::Result<()>
             }
         });
         match res {
+            // A zero-byte write on a non-empty request would never advance the
+            // offset -> a hot busy-loop that starves the single-threaded runtime
+            // (every other task, including the socket writer). Treat it as an
+            // error instead of spinning.
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "wrote zero bytes to pty master",
+                ))
+            }
             Ok(Ok(n)) => off += n,
             Ok(Err(e)) => return Err(e),
             Err(_would_block) => continue,

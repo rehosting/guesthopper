@@ -60,10 +60,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let idle_timeout = std::time::Duration::from_secs(
         std::env::var("GUESTHOPPER_IDLE_TIMEOUT_SECS")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30),
+            .and_then(|s| s.parse::<u64>().ok())
+            // Floor at 1s: a 0 would make every read time out instantly and
+            // kill every command the moment it goes idle.
+            .unwrap_or(30)
+            .max(1),
     );
     info!("Session idle timeout: {}s", idle_timeout.as_secs());
+
+    // Cap concurrent sessions. Each session forks a real shell and holds a vsock
+    // fd + two tasks, so an unbounded accept loop is a fork/fd-exhaustion vector
+    // for a confused or malicious client. Acquire a permit *before* accepting so
+    // excess connections wait in the kernel backlog rather than being served.
+    let max_sessions: usize = std::env::var("GUESTHOPPER_MAX_SESSIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1);
+    info!("Max concurrent sessions: {}", max_sessions);
+    let sessions = Arc::new(tokio::sync::Semaphore::new(max_sessions));
 
     // Generous default cap on a single `exec` command: absent a per-request
     // deadline, a wedged command is killed after this long so it can't run
@@ -88,6 +103,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     loop {
+        // Block until a session slot is free, so we never accept beyond the cap.
+        // The semaphore is never closed, so this only errors if the runtime is
+        // shutting down -- treat that as "stop accepting".
+        let permit = match Arc::clone(&sessions).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
         // Accept an incoming connection. The vsock transport already gives one
         // independent stream per CONNECT, so each accepted stream is one
         // session -- we split it into read/write halves and hand it off.
@@ -96,14 +118,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 // A transient accept error (fd pressure, an aborted connection)
                 // must not tear down the whole agent for the rest of the run;
-                // log it and keep serving.
+                // log it, drop the permit, and keep serving.
                 error!("accept failed: {}", e);
+                drop(permit);
                 continue;
             }
         };
         info!("Received connection from {}", addr);
         let shell_clone = Arc::clone(&shell);
         tokio::spawn(async move {
+            // Hold the permit for the whole session; dropped on task exit,
+            // releasing the slot.
+            let _permit = permit;
             let (reader, writer) = tokio::io::split(vsock);
             if let Err(e) =
                 run_session(reader, writer, shell_clone, idle_timeout, default_deadline).await
@@ -112,4 +138,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    Ok(())
 }
