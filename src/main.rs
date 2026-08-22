@@ -68,6 +68,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("Session idle timeout: {}s", idle_timeout.as_secs());
 
+    // Bound on how long a single frame write to the client may stall before the
+    // session is torn down. This is the backstop for a peer that stays *alive
+    // but stops reading* -- it keeps its write half active (PINGs), so the idle
+    // timeout never trips, while our writes block on a full send buffer. Without
+    // it that one client parks the writer forever and its session never releases
+    // its slot, so max_sessions of them wedge the agent. Generous by default
+    // (guest time runs slow under emulation); override with
+    // GUESTHOPPER_WRITE_TIMEOUT_SECS.
+    let write_timeout = std::time::Duration::from_secs(
+        std::env::var("GUESTHOPPER_WRITE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            // Floor at 1s: a 0 would make every write time out instantly.
+            .unwrap_or(60)
+            .max(1),
+    );
+    info!("Session write timeout: {}s", write_timeout.as_secs());
+
     // Cap concurrent sessions. Each session forks a real shell and holds a vsock
     // fd + two tasks, so an unbounded accept loop is a fork/fd-exhaustion vector
     // for a confused or malicious client. Acquire a permit *before* accepting so
@@ -94,7 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if secs <= 0.0 {
             None
         } else {
-            Some(std::time::Duration::from_secs_f64(secs))
+            // Fallible conversion: an absurd operator-set value (e.g. 1e300)
+            // must not panic the agent at startup. Fall back to 1h if it won't
+            // fit a Duration.
+            Some(
+                std::time::Duration::try_from_secs_f64(secs)
+                    .unwrap_or_else(|_| std::time::Duration::from_secs(3600)),
+            )
         }
     };
     match default_deadline {
@@ -131,8 +155,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // releasing the slot.
             let _permit = permit;
             let (reader, writer) = tokio::io::split(vsock);
-            if let Err(e) =
-                run_session(reader, writer, shell_clone, idle_timeout, default_deadline).await
+            if let Err(e) = run_session(
+                reader,
+                writer,
+                shell_clone,
+                idle_timeout,
+                write_timeout,
+                default_deadline,
+            )
+            .await
             {
                 error!("Session error from {}: {}", addr, e);
             }
