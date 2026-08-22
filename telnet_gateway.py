@@ -9,9 +9,9 @@ stays free. The internal transport is guesthopper's frame protocol; this module
 reuses ``guest_cmd.py``'s codec and pty handshake, so the wire contract lives in
 exactly one place.
 
-SSH is the planned second front door: the same bridge with an SSH terminator in
-place of the telnet one. Keeping the telnet protocol handling isolated in
-``TelnetInbound`` / ``telnet_escape`` makes that swap a localized change.
+``ssh_gateway.py`` is the sibling SSH front door: the same bridge with an SSH
+terminator in place of the telnet one. Keeping the telnet protocol handling
+isolated in ``TelnetInbound`` / ``telnet_escape`` kept that a localized change.
 
 Only the telnet<->frame translation is subtle, so it is factored into pure
 functions/classes that are unit-tested without a guest:
