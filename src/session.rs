@@ -33,8 +33,10 @@ static LONG_COMMAND_WARNED: AtomicBool = AtomicBool::new(false);
 /// A control-plane request. `verb` selects behavior; slice 1 supports `exec`
 /// with a shell-string `cmd`. `deadline` is seconds: absent -> the agent's
 /// generous default cap; `0` -> uncapped (opt-out, e.g. long-running debug
-/// tools); a positive value -> that many seconds. Validated before use so a
-/// hostile/garbage value can't panic `Duration::from_secs_f64`.
+/// tools); a positive value -> that many seconds. Converted with the fallible
+/// `Duration::try_from_secs_f64` so a hostile/garbage value (NaN, infinity,
+/// negative, or a finite-but-overflowing magnitude like `1e300`) is rejected
+/// rather than panicking the session task.
 #[derive(Debug, Deserialize)]
 pub struct Request {
     pub verb: String,
@@ -147,6 +149,7 @@ pub async fn run_session<R, W>(
     writer: W,
     shell: Arc<String>,
     idle_timeout: Duration,
+    write_timeout: Duration,
     default_deadline: Option<Duration>,
 ) -> anyhow::Result<()>
 where
@@ -161,11 +164,17 @@ where
     // tear down against a dead client:
     //   * the write to the peer errors (a genuine RST) -> the writer fires it;
     //   * the peer dies abruptly and the vsock surfaces neither a read EOF nor
-    //     a write error, just backpressure -> the reader's idle timeout fires it.
-    // The writer selects on `cancel` around *both* its recv and its write, so a
-    // wedged socket (write blocked on a dead-but-backpressuring peer) can't pin
-    // the task forever -- firing `cancel` breaks it out and closes the channel,
-    // which in turn unblocks any producer parked on a full queue.
+    //     a write error, just backpressure -> the reader's idle timeout fires it;
+    //   * the peer stays *alive but stops reading* (keeps its write half active
+    //     with PINGs, so the idle timeout never trips) while our writes stall on
+    //     a full send buffer -> the writer's own `write_timeout` fires it.
+    // Without that last bound a single such client parks the writer inside
+    // `write_frame` forever, and because the session task then never finishes it
+    // never releases its concurrency permit -- `max_sessions` of them silently
+    // wedge the whole agent. The writer selects on `cancel` around its recv and
+    // bounds each write by `write_timeout`; on error *or* stall it fires
+    // `cancel`, which breaks it out, closes the channel (unblocking any producer
+    // parked on a full queue), and tears down the running verb's child.
     let (tx, mut rx) = mpsc::channel::<(u8, Vec<u8>)>(CHANNEL_BOUND);
     let cancel = Arc::new(Cancel::default());
     let cancel_w = Arc::clone(&cancel);
@@ -180,8 +189,11 @@ where
                         tokio::select! {
                             biased;
                             _ = cancel_w.wait() => break,
-                            r = frame::write_frame(&mut w, ftype, &payload) => {
-                                if r.is_err() {
+                            r = timeout(write_timeout, frame::write_frame(&mut w, ftype, &payload)) => {
+                                // Timed out (Err elapsed) == an alive-but-not-
+                                // reading peer stalling us; inner Err == a write
+                                // error (RST). Either way, tear the session down.
+                                if r.is_err() || r.unwrap().is_err() {
                                     cancel_w.fire();
                                     break;
                                 }
@@ -271,21 +283,33 @@ where
     // Resolve the effective deadline. Absent -> the agent's generous default (a
     // safety net so a wedged command can't run forever); an explicit `0` -> no
     // cap (opt-out for gdbserver/strace and other session-length commands); a
-    // positive value -> that many seconds. Reject non-finite/negative rather
-    // than letting `Duration::from_secs_f64` panic on a client-supplied f64.
+    // positive value -> that many seconds.
     let effective_deadline: Option<Duration> = match req.deadline {
         None => default_deadline,
-        Some(s) if s.is_finite() && s >= 0.0 => {
-            // 0 is the explicit opt-out (no cap); any positive value is the cap.
+        // Compare in the body, not a match guard: a `Some(0.0)` literal pattern
+        // trips the deny-by-default illegal_floating_point_literal_pattern lint.
+        Some(s) => {
             if s == 0.0 {
+                // 0 is the explicit opt-out (no cap).
                 None
             } else {
-                Some(Duration::from_secs_f64(s))
+                // Any other value must convert cleanly. `try_from_secs_f64`
+                // rejects NaN, infinities, negatives, *and* finite-but-too-large
+                // magnitudes that would overflow `Duration` (which the panicking
+                // `from_secs_f64` does not), so a hostile `deadline: 1e300` is
+                // refused, not a crash.
+                match Duration::try_from_secs_f64(s) {
+                    Ok(d) => Some(d),
+                    Err(_) => {
+                        send_error(
+                            tx,
+                            &format!("invalid deadline {s}: must be finite, >= 0, and in range"),
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                }
             }
-        }
-        Some(bad) => {
-            send_error(tx, &format!("invalid deadline {bad}: must be finite and >= 0")).await;
-            return Ok(());
         }
     };
 
@@ -463,6 +487,21 @@ where
     }
     set_winsize(master, req.rows.unwrap_or(24), req.cols.unwrap_or(80));
 
+    // Keep the pty master out of the child. openpty(3) does not set O_CLOEXEC,
+    // so without this the forked shell -- and everything it spawns -- inherits
+    // the master fd: an fd leak, and worse, the shell could write() to its own
+    // master and inject bytes into the STDOUT stream the host sees. Set it now,
+    // before spawn, so the child never gets it. (The slave, dup'd below into the
+    // child's stdio, deliberately does not get CLOEXEC.)
+    if let Err(e) = set_cloexec(master) {
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        send_error(tx, &format!("failed to set pty master close-on-exec: {e}")).await;
+        return Ok(());
+    }
+
     let parts = shlex::split(shell).unwrap_or_default();
     let (program, extra) = match parts.split_first() {
         Some((p, rest)) => (p.clone(), rest.to_vec()),
@@ -523,6 +562,14 @@ where
             return Ok(());
         }
     };
+    // Release the parent's copies of the child's stdio -- the d0/d1/d2 dups of
+    // the slave that `cmd` still owns. Until they are dropped the slave file
+    // description stays referenced on our side, so closing our own `slave` fd
+    // below would *not* make the master see HUP/EIO when the child exits, and
+    // out_task would fall back entirely on its abort timer. Dropping `cmd` now
+    // means that once the child's own 0/1/2 close on exit, the slave is fully
+    // released and the master gets a real EOF edge.
+    drop(cmd);
     // The parent doesn't use the slave; closing it means reads on the master
     // report EOF/EIO once the child's copies are gone.
     unsafe { libc::close(slave) };
@@ -661,6 +708,17 @@ async fn hangup(
             child.wait().await
         }
     }
+}
+
+fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {

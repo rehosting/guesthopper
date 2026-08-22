@@ -139,6 +139,12 @@ if asyncssh is not None:
             return True
 
         def exec_requested(self, command):
+            # With encoding=None (a binary channel) asyncssh delivers the exec
+            # command as bytes; decode it for the JSON exec request. Lossy so a
+            # non-UTF-8 command can't crash the session with a TypeError in
+            # json.dumps.
+            if isinstance(command, (bytes, bytearray)):
+                command = bytes(command).decode("utf-8", "replace")
             self._command = command
             return True
 
@@ -227,8 +233,16 @@ if asyncssh is not None:
                     if frame is None:
                         break
                     ftype, payload = frame
-                    if ftype in (FRAME_STDOUT, FRAME_STDERR):
+                    if ftype == FRAME_STDOUT:
                         self._chan.write(payload)
+                    elif ftype == FRAME_STDERR:
+                        # A pty has a single tty stream, so fold stderr into it;
+                        # for an exec (non-pty) session keep it on the SSH stderr
+                        # stream so `ssh host cmd 2>err` separates correctly.
+                        if self._want_pty:
+                            self._chan.write(payload)
+                        else:
+                            self._chan.write_stderr(payload)
                     elif ftype == FRAME_EXIT:
                         code = json.loads(payload or b"{}").get("code", 0)
                         self._chan.exit(code if isinstance(code, int) else 0)

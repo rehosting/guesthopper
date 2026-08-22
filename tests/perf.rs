@@ -64,6 +64,7 @@ async fn perf_exec_stream_throughput() {
         g_wr,
         Arc::new("/bin/sh".to_string()),
         std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(120),
         None,
     ));
 
@@ -109,6 +110,7 @@ async fn perf_exec_roundtrip_latency() {
             g_rd,
             g_wr,
             Arc::new("/bin/sh".to_string()),
+            std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(30),
             None,
         ));
