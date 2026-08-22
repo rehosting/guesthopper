@@ -55,15 +55,23 @@ class FakeSocket:
 
 
 class GuestCmdTests(unittest.TestCase):
-    def test_find_vsocket_returns_first_sorted_match(self):
+    def test_find_vsocket_returns_single_match(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            os.makedirs(os.path.join(tmpdir, "b"))
             os.makedirs(os.path.join(tmpdir, "a"))
-            open(os.path.join(tmpdir, "b", "vsocket-2"), "w").close()
-            open(os.path.join(tmpdir, "a", "vsocket-1"), "w").close()
-
-            expected = os.path.join(tmpdir, "a", "vsocket-1")
+            expected = os.path.join(tmpdir, "a", "vsocket")
+            open(expected, "w").close()
             self.assertEqual(guest_cmd.find_vsocket(tmpdir), expected)
+
+    def test_find_vsocket_errors_on_ambiguous_match(self):
+        # Two runs -> two vsockets. Guessing would target the wrong emulated
+        # device silently, so find_vsocket must refuse rather than pick one.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "a"))
+            os.makedirs(os.path.join(tmpdir, "b"))
+            open(os.path.join(tmpdir, "a", "vsocket"), "w").close()
+            open(os.path.join(tmpdir, "b", "vsocket"), "w").close()
+            with self.assertRaisesRegex(guest_cmd.GuestCommandError, "Multiple vsockets"):
+                guest_cmd.find_vsocket(tmpdir)
 
     def test_find_vsocket_errors_when_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -108,7 +116,9 @@ class GuestCmdTests(unittest.TestCase):
 
         result = guest_cmd.run_guest_with_socket(sock, 123, "echo out")
 
-        self.assertEqual(result, {"stdout": "out", "stderr": "err", "exit_code": 0})
+        self.assertEqual(
+            result, {"stdout": "out", "stderr": "err", "exit_code": 0, "reason": None}
+        )
         line, frames = sock.sent_frames()
         self.assertEqual(line, b"CONNECT 123\n")
         self.assertEqual(len(frames), 1)
@@ -117,6 +127,25 @@ class GuestCmdTests(unittest.TestCase):
         req = json.loads(payload)
         self.assertEqual(req["verb"], "exec")
         self.assertEqual(req["cmd"], "export PATH=/igloo/utils:$PATH; echo out")
+        # No --timeout given -> no deadline field, so the agent applies its default.
+        self.assertNotIn("deadline", req)
+
+    def test_request_includes_deadline_when_set(self):
+        incoming = b"OK 1\n" + _frame(guest_cmd.FRAME_EXIT, json.dumps({"code": 0}).encode())
+        sock = FakeSocket(incoming)
+        guest_cmd.run_guest_with_socket(sock, 1, "x", deadline=0)
+        _, frames = sock.sent_frames()
+        req = json.loads(frames[0][1])
+        # deadline 0 is the explicit opt-out and must be sent (not dropped).
+        self.assertEqual(req["deadline"], 0)
+
+    def test_exit_reason_is_surfaced(self):
+        incoming = b"OK 1\n" + _frame(
+            guest_cmd.FRAME_EXIT, json.dumps({"code": 137, "reason": "timeout"}).encode()
+        )
+        result = guest_cmd.run_guest_with_socket(FakeSocket(incoming), 1, "x")
+        self.assertEqual(result["exit_code"], 137)
+        self.assertEqual(result["reason"], "timeout")
 
     def test_streamed_stdout_reassembles_across_frames(self):
         incoming = (

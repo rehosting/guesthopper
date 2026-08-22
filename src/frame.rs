@@ -67,6 +67,16 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     ftype: u8,
     payload: &[u8],
 ) -> std::io::Result<()> {
+    // Guard the write side the same way `read_frame` guards the read side: a
+    // payload over MAX_FRAME_LEN would truncate in the `as u32` length header
+    // and desync the stream. Not reachable today (our chunks are READ_CHUNK),
+    // but the cast must not silently lie about the length.
+    if payload.len() > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame payload {} exceeds MAX_FRAME_LEN {MAX_FRAME_LEN}", payload.len()),
+        ));
+    }
     let mut hdr = [0u8; 5];
     hdr[0] = ftype;
     hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
