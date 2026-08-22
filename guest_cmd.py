@@ -27,6 +27,13 @@ MAX_FRAME_LEN = 16 * 1024 * 1024
 # (default 30s) never trips on a live-but-quiet session. Well under that budget.
 PING_INTERVAL_S = 5
 
+# Once bytes of a frame (or the handshake line) start arriving, the rest must
+# follow promptly -- frames are written contiguously. This bounds a peer that
+# sends a partial frame/header and then goes silent (or a crash mid-frame) so a
+# read never blocks forever. It does NOT bound a long, quiet command: the idle
+# wait between frames is handled by select() + PING, not by this socket timeout.
+FRAME_READ_TIMEOUT_S = 30
+
 
 def prepare_command(command):
     return f"export PATH=/igloo/utils:$PATH; {command}"
@@ -43,6 +50,15 @@ def find_vsocket(search_root="/tmp"):
         raise GuestCommandError(f"No vsocket found under {search_root}")
 
     matches.sort()
+    if len(matches) > 1:
+        # Two concurrent penguin runs each drop a vsocket under /tmp. Guessing
+        # would run the command on whichever path sorts first -- silently the
+        # wrong emulated device. Refuse and make the caller disambiguate.
+        listing = "\n  ".join(matches)
+        raise GuestCommandError(
+            f"Multiple vsockets found under {search_root}; refusing to guess "
+            f"which run you mean -- pass --socket explicitly. Candidates:\n  {listing}"
+        )
     return matches[0]
 
 
@@ -95,14 +111,16 @@ def read_frame(sock):
     return (ftype, payload)
 
 
-def run_guest(unix_socket, port, command, use_stdio=True):
+def run_guest(unix_socket, port, command, use_stdio=True, deadline=None):
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.connect(unix_socket)
-            # Disable timeout for long-running commands.
-            sock.settimeout(None)
+            # A per-read timeout bounds a stalled/partial-frame peer without
+            # capping a long, quiet command (the idle wait is select-driven with
+            # keepalive PINGs, below).
+            sock.settimeout(FRAME_READ_TIMEOUT_S)
 
-            result = run_guest_with_socket(sock, port, command)
+            result = run_guest_with_socket(sock, port, command, deadline=deadline)
     except OSError as e:
         raise GuestCommandError(f"Socket error while talking to {unix_socket}: {e}") from e
 
@@ -112,10 +130,16 @@ def run_guest(unix_socket, port, command, use_stdio=True):
     print(result["stdout"], end="")
     if result["stderr"]:
         print(result["stderr"], file=sys.stderr, end="")
+    # Distinguish an abnormal end from a plain non-zero exit so a killed command
+    # doesn't look like it merely failed.
+    if result.get("reason") == "timeout":
+        print("guest_cmd: command exceeded its timeout and was killed", file=sys.stderr)
+    elif result.get("reason") == "disconnected":
+        print("guest_cmd: command was killed after the client disconnected", file=sys.stderr)
     sys.exit(result["exit_code"])
 
 
-def run_guest_with_socket(sock, port, command):
+def run_guest_with_socket(sock, port, command, deadline=None):
     # vhost-device-vsock hybrid handshake: CONNECT <port> / expect OK <port>.
     # This is the transport's, not guesthopper's -- unchanged by the framing
     # rework. The guest agent sends no bytes until it receives our REQUEST, so
@@ -136,7 +160,11 @@ def run_guest_with_socket(sock, port, command):
         )
 
     try:
-        request = {"verb": "exec", "cmd": prepare_command(command), "deadline": None}
+        request = {"verb": "exec", "cmd": prepare_command(command)}
+        # Omit `deadline` to accept the agent's generous default cap; send 0 to
+        # opt out (uncapped, for long-running debug commands); send N for N s.
+        if deadline is not None:
+            request["deadline"] = deadline
         write_frame(sock, FRAME_REQUEST, json.dumps(request).encode("utf-8"))
         return _collect_result(sock)
     except OSError as e:
@@ -150,6 +178,7 @@ def _collect_result(sock):
     stdout = bytearray()
     stderr = bytearray()
     exit_code = None
+    reason = None
 
     while True:
         # Keep the session alive on the agent side during a long, quiet command:
@@ -172,7 +201,9 @@ def _collect_result(sock):
         elif ftype == FRAME_STDERR:
             stderr.extend(payload)
         elif ftype == FRAME_EXIT:
-            exit_code = _parse_json(payload).get("code")
+            obj = _parse_json(payload)
+            exit_code = obj.get("code")
+            reason = obj.get("reason")
             if not isinstance(exit_code, int):
                 raise GuestCommandError("EXIT frame missing integer 'code'")
             break
@@ -188,6 +219,7 @@ def _collect_result(sock):
         "stdout": stdout.decode("utf-8", errors="replace"),
         "stderr": stderr.decode("utf-8", errors="replace"),
         "exit_code": exit_code,
+        "reason": reason,
     }
 
 
@@ -252,19 +284,40 @@ def run_shell(unix_socket, port):
     is_tty = os.isatty(stdin_fd)
     rows, cols = _term_size(stdin_fd) if is_tty else (24, 80)
 
+    old_attrs = None
+    old_winch = old_term = old_hup = None
+
+    def _restore_terminal():
+        if is_tty and old_attrs is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
+            except Exception:  # noqa: BLE001 - best-effort on teardown
+                pass
+
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.connect(unix_socket)
-            sock.settimeout(None)
+            # Bound stalled/partial-frame reads (idle waits are select-driven).
+            sock.settimeout(FRAME_READ_TIMEOUT_S)
             shell_handshake(sock, port, rows, cols)
 
             old_attrs = termios.tcgetattr(stdin_fd) if is_tty else None
             if is_tty:
                 tty.setraw(stdin_fd)
-                signal.signal(
+                old_winch = signal.signal(
                     signal.SIGWINCH,
                     lambda *_: _safe_resize(sock, *_term_size(stdin_fd)),
                 )
+
+                # In raw mode, a SIGTERM/SIGHUP would kill us without unwinding
+                # the `finally`, leaving the user's terminal stuck (no echo, no
+                # line editing). Restore the tty first, then terminate.
+                def _sig_restore(signum, _frame):
+                    _restore_terminal()
+                    os._exit(128 + signum)
+
+                old_term = signal.signal(signal.SIGTERM, _sig_restore)
+                old_hup = signal.signal(signal.SIGHUP, _sig_restore)
 
             exit_code = 0
             try:
@@ -301,7 +354,8 @@ def run_shell(unix_socket, port):
                         elif ftype == FRAME_STDERR:
                             os.write(sys.stderr.fileno(), payload)
                         elif ftype == FRAME_EXIT:
-                            exit_code = _parse_json(payload).get("code", 0)
+                            code = _parse_json(payload).get("code", 0)
+                            exit_code = code if isinstance(code, int) else 0
                             break
                         elif ftype == FRAME_ERROR:
                             msg = _parse_json(payload).get("message", "")
@@ -309,8 +363,16 @@ def run_shell(unix_socket, port):
                             exit_code = 1
                             break
             finally:
-                if is_tty and old_attrs is not None:
-                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
+                _restore_terminal()
+                # Uninstall our handlers so a stale one can't fire against a
+                # closed socket / restored terminal later.
+                if is_tty:
+                    if old_winch is not None:
+                        signal.signal(signal.SIGWINCH, old_winch)
+                    if old_term is not None:
+                        signal.signal(signal.SIGTERM, old_term)
+                    if old_hup is not None:
+                        signal.signal(signal.SIGHUP, old_hup)
     except OSError as e:
         raise GuestCommandError(f"Socket error while talking to {unix_socket}: {e}") from e
 
@@ -342,6 +404,14 @@ def main(argv=None):
                         help="Open an interactive pty shell on the guest instead of "
                         "running a one-shot command.")
 
+    parser.add_argument("--timeout",
+                        type=float,
+                        default=None,
+                        help="Max seconds a one-shot command may run before the guest "
+                        "kills it. Omit for the agent's generous default cap; pass 0 to "
+                        "disable the cap (for long-running commands like gdbserver). "
+                        "Ignored with --shell.")
+
     parser.add_argument("command",
                         nargs=argparse.REMAINDER,
                         help="The command to run on the server.")
@@ -356,7 +426,7 @@ def main(argv=None):
         if args.shell:
             return run_shell(unix_socket, args.port)
         command = " ".join(args.command)
-        run_guest(unix_socket, args.port, command)
+        run_guest(unix_socket, args.port, command, deadline=args.timeout)
     except GuestCommandError as e:
         print(f"guest_cmd: {e}", file=sys.stderr)
         return 1

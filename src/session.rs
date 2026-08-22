@@ -6,6 +6,7 @@
 //! close. Later slices add `open-pty` / `run-script` verbs on the same frames.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,18 +15,26 @@ use serde::Deserialize;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, Sender};
 use tokio::time::{timeout, Duration};
 
 use crate::frame;
 
 const READ_CHUNK: usize = 32 * 1024;
 const LONG_COMMAND_THRESHOLD: usize = 2048;
+/// Bound on queued outbound frames per session. A fast command with a slow (or
+/// backpressured-but-alive) client must not grow the queue without limit and
+/// OOM a scarce-RAM guest, so the channel is bounded: producers block on a full
+/// queue (backpressure) instead of allocating forever. ~2 MiB worst case
+/// (CHANNEL_BOUND * READ_CHUNK).
+const CHANNEL_BOUND: usize = 64;
 static LONG_COMMAND_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// A control-plane request. `verb` selects behavior; slice 1 supports `exec`
-/// with a shell-string `cmd`. `deadline` is opt-in seconds (default: none, so
-/// interactive/long commands are not capped -- unlike the old hardcoded 10 s).
+/// with a shell-string `cmd`. `deadline` is seconds: absent -> the agent's
+/// generous default cap; `0` -> uncapped (opt-out, e.g. long-running debug
+/// tools); a positive value -> that many seconds. Validated before use so a
+/// hostile/garbage value can't panic `Duration::from_secs_f64`.
 #[derive(Debug, Deserialize)]
 pub struct Request {
     pub verb: String,
@@ -46,17 +55,90 @@ struct Resize {
     cols: u16,
 }
 
-type Tx = UnboundedSender<(u8, Vec<u8>)>;
-
-fn send(tx: &Tx, ftype: u8, payload: Vec<u8>) {
-    // A closed receiver just means the peer went away; drop the frame.
-    let _ = tx.send((ftype, payload));
+/// One-shot, multi-waiter cancellation. `fire()` wakes every current and future
+/// waiter; `wait()` resolves immediately once fired. Unlike a bare `Notify`
+/// (whose single stored permit is consumed by one waiter), this lets the writer
+/// task *and* the running verb both observe the same teardown signal -- which we
+/// need, because tearing down a dead-peer session requires killing the child
+/// *and* unblocking the writer.
+#[derive(Default)]
+pub struct Cancel {
+    fired: AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
-fn send_error(tx: &Tx, msg: &str) {
+impl Cancel {
+    fn fire(&self) {
+        self.fired.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+    async fn wait(&self) {
+        loop {
+            if self.fired.load(Ordering::SeqCst) {
+                return;
+            }
+            let n = self.notify.notified();
+            tokio::pin!(n);
+            // Arm the notification, then re-check the flag: `notify_waiters`
+            // only wakes already-armed waiters, so a `fire()` that races our
+            // load would otherwise be lost.
+            n.as_mut().enable();
+            if self.fired.load(Ordering::SeqCst) {
+                return;
+            }
+            n.await;
+        }
+    }
+}
+
+type Tx = Sender<(u8, Vec<u8>)>;
+
+async fn send(tx: &Tx, ftype: u8, payload: Vec<u8>) {
+    // A closed receiver just means the peer went away; drop the frame.
+    let _ = tx.send((ftype, payload)).await;
+}
+
+async fn send_error(tx: &Tx, msg: &str) {
     let payload = serde_json::to_vec(&serde_json::json!({ "message": msg }))
         .unwrap_or_else(|_| Vec::new());
-    send(tx, frame::FRAME_ERROR, payload);
+    send(tx, frame::FRAME_ERROR, payload).await;
+}
+
+/// Derive the EXIT frame's `(code, reason)`. A teardown `override` ("timeout" /
+/// "disconnected") wins over the signal we used to kill the child; otherwise the
+/// reason is derived from how the child actually ended:
+///   - "exited"   normal exit (code is the process's exit status)
+///   - "signaled" killed by a signal we did not send (code = 128 + signal)
+///   - "error"    we failed to reap the child
+fn exit_fields(
+    status: std::io::Result<std::process::ExitStatus>,
+    reason_override: &'static str,
+) -> (i32, &'static str) {
+    match status {
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                (code, if reason_override.is_empty() { "exited" } else { reason_override })
+            } else if let Some(sig) = s.signal() {
+                // Killed by a signal. Report the conventional 128+signal code so
+                // the number is still meaningful, and label *why* if we know.
+                (128 + sig, if reason_override.is_empty() { "signaled" } else { reason_override })
+            } else {
+                (-1, if reason_override.is_empty() { "exited" } else { reason_override })
+            }
+        }
+        Err(_) => (-1, "error"),
+    }
+}
+
+/// SIGKILL the child's whole process group (negative pid). `exec` spawns the
+/// child with `process_group(0)`, so this reaps `cmd &` grandchildren too, not
+/// just the shell -- otherwise they are reparented to init and survive. A
+/// fully-detached daemon that called `setsid()` itself escapes; the bounded
+/// output drain in `exec` covers that residual case.
+fn kill_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    }
 }
 
 /// Run one session to completion over the given reader/writer halves.
@@ -65,46 +147,60 @@ pub async fn run_session<R, W>(
     writer: W,
     shell: Arc<String>,
     idle_timeout: Duration,
+    default_deadline: Option<Duration>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     // A single writer task owns the write half; every producer sends frames
-    // through the channel. This serializes writes without a lock and gives
-    // natural per-session backpressure via the socket buffer.
+    // through the bounded channel. This serializes writes without a lock and
+    // gives per-session backpressure.
     //
-    // `cancel` is the peer-gone signal. An abrupt client disconnect (crash,
-    // SIGKILL) does not reliably deliver a read EOF to the guest vsock, so the
-    // reader side (input_task) can stay blocked forever -- but the first write
-    // to the dead peer fails. The writer fires `cancel` on that failure so the
-    // running verb can tear down (hang up the pty shell / kill the exec child)
-    // instead of orphaning it and letting out_task fill the channel unbounded.
-    // notify_one() stores a permit, so a cancel that races ahead of the
-    // consumer's notified() is still observed.
-    let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
-    let cancel = Arc::new(tokio::sync::Notify::new());
+    // `cancel` is the peer-gone signal. Two things can make a session need to
+    // tear down against a dead client:
+    //   * the write to the peer errors (a genuine RST) -> the writer fires it;
+    //   * the peer dies abruptly and the vsock surfaces neither a read EOF nor
+    //     a write error, just backpressure -> the reader's idle timeout fires it.
+    // The writer selects on `cancel` around *both* its recv and its write, so a
+    // wedged socket (write blocked on a dead-but-backpressuring peer) can't pin
+    // the task forever -- firing `cancel` breaks it out and closes the channel,
+    // which in turn unblocks any producer parked on a full queue.
+    let (tx, mut rx) = mpsc::channel::<(u8, Vec<u8>)>(CHANNEL_BOUND);
+    let cancel = Arc::new(Cancel::default());
     let cancel_w = Arc::clone(&cancel);
     let writer_task = tokio::spawn(async move {
         let mut w = writer;
-        while let Some((ftype, payload)) = rx.recv().await {
-            if frame::write_frame(&mut w, ftype, &payload).await.is_err() {
-                cancel_w.notify_one();
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_w.wait() => break,
+                maybe = rx.recv() => match maybe {
+                    Some((ftype, payload)) => {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_w.wait() => break,
+                            r = frame::write_frame(&mut w, ftype, &payload) => {
+                                if r.is_err() {
+                                    cancel_w.fire();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    None => break, // all senders dropped: session done
+                }
             }
         }
     });
 
-    // A second liveness net for the case `cancel` can't catch: an abrupt client
-    // death that the vsock transport surfaces as neither a read EOF nor a write
-    // error (the guest write just backpressures). The input readers below bound
-    // each read by `idle_timeout`; a live client keeps the deadline fresh by
-    // sending FRAME_PING on idle, so a lapse means the peer is gone -> tear down.
-    let result = drive(&mut reader, &tx, shell, cancel, idle_timeout).await;
+    let result = drive(&mut reader, &tx, shell, cancel, idle_timeout, default_deadline).await;
     if let Err(e) = &result {
-        send_error(&tx, &format!("session error: {e}"));
+        send_error(&tx, &format!("session error: {e}")).await;
     }
     drop(tx);
+    // Bounded by construction: the writer exits when the channel closes (all
+    // senders dropped) or when `cancel` fires, so this never parks forever.
     let _ = writer_task.await;
     result
 }
@@ -113,8 +209,9 @@ async fn drive<R>(
     reader: &mut R,
     tx: &Tx,
     shell: Arc<String>,
-    cancel: Arc<tokio::sync::Notify>,
+    cancel: Arc<Cancel>,
     idle_timeout: Duration,
+    default_deadline: Option<Duration>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -124,23 +221,23 @@ where
             match serde_json::from_slice::<Request>(&f.payload) {
                 Ok(r) => r,
                 Err(e) => {
-                    send_error(tx, &format!("invalid REQUEST json: {e}"));
+                    send_error(tx, &format!("invalid REQUEST json: {e}")).await;
                     return Ok(());
                 }
             }
         }
         Some(_) => {
-            send_error(tx, "expected a REQUEST frame first");
+            send_error(tx, "expected a REQUEST frame first").await;
             return Ok(());
         }
         None => return Ok(()), // peer closed before sending anything
     };
 
     match req.verb.as_str() {
-        "exec" => exec(reader, tx, &shell, req, &cancel, idle_timeout).await,
+        "exec" => exec(reader, tx, &shell, req, &cancel, idle_timeout, default_deadline).await,
         "open-pty" => open_pty(reader, tx, &shell, req, &cancel, idle_timeout).await,
         other => {
-            send_error(tx, &format!("unsupported verb: {other:?}"));
+            send_error(tx, &format!("unsupported verb: {other:?}")).await;
             Ok(())
         }
     }
@@ -151,14 +248,36 @@ async fn exec<R>(
     tx: &Tx,
     shell: &str,
     req: Request,
-    cancel: &tokio::sync::Notify,
+    cancel: &Cancel,
     idle_timeout: Duration,
+    default_deadline: Option<Duration>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let cmd = req.cmd.unwrap_or_default();
     warn_long_command(&cmd);
+
+    // Resolve the effective deadline. Absent -> the agent's generous default (a
+    // safety net so a wedged command can't run forever); an explicit `0` -> no
+    // cap (opt-out for gdbserver/strace and other session-length commands); a
+    // positive value -> that many seconds. Reject non-finite/negative rather
+    // than letting `Duration::from_secs_f64` panic on a client-supplied f64.
+    let effective_deadline: Option<Duration> = match req.deadline {
+        None => default_deadline,
+        Some(s) if s.is_finite() && s >= 0.0 => {
+            // 0 is the explicit opt-out (no cap); any positive value is the cap.
+            if s == 0.0 {
+                None
+            } else {
+                Some(Duration::from_secs_f64(s))
+            }
+        }
+        Some(bad) => {
+            send_error(tx, &format!("invalid deadline {bad}: must be finite and >= 0")).await;
+            return Ok(());
+        }
+    };
 
     // Resolve the shell program (same logic as before): split the configured
     // shell string; if the program isn't a shell, run `sh` with it as argv[0].
@@ -175,7 +294,8 @@ where
 
     // `-c <cmd>` runs the command via argv, leaving the child's stdin free to
     // carry host STDIN frames (the old path fed the command through stdin, so
-    // it could not also stream input).
+    // it could not also stream input). `process_group(0)` puts the child in its
+    // own group so a deadline/disconnect kill can signal the whole tree.
     let mut child = Command::new(&program)
         .arg0(&arg0)
         .args(&extra)
@@ -184,6 +304,7 @@ where
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
 
     let mut cstdout = child.stdout.take().expect("piped stdout");
@@ -199,14 +320,8 @@ where
         pump(&mut cstderr, frame::FRAME_STDERR, &tx_err).await;
     });
 
-    // Forward host STDIN frames to the child until EOF/close. This task holds
-    // no `tx` clone, so it never blocks the writer from finishing; it is
-    // aborted once the child exits.
+    // Forward host STDIN frames to the child until EOF/close.
     let stdin_task = {
-        // Move the reader into the task by re-borrowing through an owned value.
-        // `reader` is `&mut R`; we cannot move it, so read inline in a loop and
-        // hand ownership of stdin to the task via a channel-free closure is not
-        // possible -- instead we drive stdin here concurrently with wait below.
         let mut cstdin = cstdin;
         async move {
             loop {
@@ -215,7 +330,7 @@ where
                 // cancel (the select below is biased to kill the child on it).
                 match timeout(idle_timeout, frame::read_frame(reader)).await {
                     Err(_elapsed) => {
-                        cancel.notify_one();
+                        cancel.fire();
                         break;
                     }
                     Ok(Ok(Some(f))) if f.ftype == frame::FRAME_STDIN => {
@@ -236,64 +351,58 @@ where
         }
     };
 
-    // Run stdin forwarding concurrently with waiting for the child. `select`
-    // lets whichever finishes first proceed; stdin forwarding ending does not
-    // kill the child, and the child exiting stops us waiting on stdin.
-    // Capture the pid before `wait` takes its mutable borrow of `child`, so the
-    // cancel branch can signal the child without a second borrow (it reaps via
-    // the existing `wait` future).
+    // Run stdin forwarding concurrently with waiting for the child, plus the
+    // deadline timer and the cancel signal. Capture the pid before `wait` takes
+    // its borrow so the kill branches can signal without a second borrow.
     let child_pid = child.id();
-    let code = {
+    let (raw, reason_override): (std::io::Result<std::process::ExitStatus>, &'static str) = {
         tokio::pin!(stdin_task);
-        let wait = async {
-            if let Some(secs) = req.deadline {
-                match timeout(Duration::from_secs_f64(secs), child.wait()).await {
-                    Ok(status) => status,
-                    Err(_) => {
-                        let _ = child.start_kill();
-                        child.wait().await
-                    }
-                }
-            } else {
-                child.wait().await
+        let wait = child.wait();
+        tokio::pin!(wait);
+        // A never-ready timer stands in for "no deadline", so the select arm is
+        // always present and we don't branch the whole loop on Option.
+        let deadline_timer = async {
+            match effective_deadline {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending::<()>().await,
             }
         };
-        tokio::pin!(wait);
+        tokio::pin!(deadline_timer);
+        let mut stdin_done = false;
         loop {
             tokio::select! {
-                // Biased so that when a stdin-idle lapse fires `cancel` and ends
-                // stdin_task in the same poll, the kill wins over "keep waiting".
+                // Biased so a stdin-idle lapse that fires `cancel` and ends
+                // stdin_task in the same poll kills the child rather than looping.
                 biased;
-                _ = cancel.notified() => {
-                    // The peer is gone (writer failed, or no frame within
-                    // idle_timeout). Don't keep the command running against a
-                    // dead client -- kill it, then reap via the existing `wait`
-                    // future (which owns the &mut child borrow).
-                    if let Some(pid) = child_pid {
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                    }
-                    let status = (&mut wait).await;
-                    break status.ok().and_then(|s| s.code()).unwrap_or(-1);
+                _ = cancel.wait() => {
+                    // Peer gone (writer failed, or no frame within idle_timeout).
+                    kill_group(child_pid);
+                    break ((&mut wait).await, "disconnected");
+                }
+                _ = &mut deadline_timer => {
+                    kill_group(child_pid);
+                    break ((&mut wait).await, "timeout");
                 }
                 status = &mut wait => {
-                    break status.ok().and_then(|s| s.code()).unwrap_or(-1);
+                    break (status, "");
                 }
-                _ = &mut stdin_task => {
-                    // stdin drained/closed cleanly; keep waiting for the child.
-                    let status = (&mut wait).await;
-                    break status.ok().and_then(|s| s.code()).unwrap_or(-1);
+                // Guarded so a completed stdin_task is never re-polled; cancel
+                // and the deadline stay live for the rest of the child's life,
+                // so a client that half-closes stdin and then dies is still
+                // caught (previously exec stopped honoring cancel after EOF).
+                _ = &mut stdin_task, if !stdin_done => {
+                    stdin_done = true;
                 }
             }
         }
     };
 
     // Drain remaining output before signalling exit -- but bound it. If the
-    // command backgrounded a process (`cmd &`) or a killed shell left an
-    // orphan, that grandchild inherits the stdout/stderr pipe write-end, so the
-    // pump tasks never see EOF and would block EXIT indefinitely. After the
-    // shell itself has exited, give the pumps a short grace to flush buffered
-    // output, then abort them so their `tx` clones drop and the writer can
-    // finish (mirrors the pty path's bounded drain).
+    // command backgrounded a process (`cmd &`) or a killed shell left an orphan
+    // that escaped the group kill (its own setsid), that grandchild inherits the
+    // stdout/stderr pipe write-end, so the pumps never see EOF and would block
+    // EXIT indefinitely. Give the pumps a short grace to flush, then abort them
+    // so their `tx` clones drop and the writer can finish.
     let grace = Duration::from_millis(250);
     if timeout(grace, &mut out_task).await.is_err() {
         out_task.abort();
@@ -302,8 +411,9 @@ where
         err_task.abort();
     }
 
-    let payload = serde_json::to_vec(&serde_json::json!({ "code": code }))?;
-    send(tx, frame::FRAME_EXIT, payload);
+    let (code, reason) = exit_fields(raw, reason_override);
+    let payload = serde_json::to_vec(&serde_json::json!({ "code": code, "reason": reason }))?;
+    send(tx, frame::FRAME_EXIT, payload).await;
     Ok(())
 }
 
@@ -318,7 +428,7 @@ async fn open_pty<R>(
     tx: &Tx,
     shell: &str,
     req: Request,
-    cancel: &tokio::sync::Notify,
+    cancel: &Cancel,
     idle_timeout: Duration,
 ) -> anyhow::Result<()>
 where
@@ -338,7 +448,7 @@ where
     };
     if rc < 0 {
         // e.g. no /dev/ptmx / CONFIG_UNIX98_PTYS in the guest kernel.
-        send_error(tx, &format!("openpty failed: {}", std::io::Error::last_os_error()));
+        send_error(tx, &format!("openpty failed: {}", std::io::Error::last_os_error())).await;
         return Ok(());
     }
     set_winsize(master, req.rows.unwrap_or(24), req.cols.unwrap_or(80));
@@ -350,15 +460,36 @@ where
     };
     let arg0 = if program.ends_with("sh") { program.clone() } else { "sh".to_string() };
 
-    // Give the child the slave as stdio (three dups Command owns), and make it
-    // the controlling terminal in a pre-exec hook (setsid + TIOCSCTTY).
+    // Give the child the slave as stdio via three dups (Command owns them).
+    // Check each dup: under fd exhaustion `dup` returns -1, and wrapping -1 in
+    // an OwnedFd/Stdio is a latent footgun -- fail the request cleanly instead
+    // of relying on `spawn()` to reject the bogus fd.
+    let (d0, d1, d2) = unsafe { (libc::dup(slave), libc::dup(slave), libc::dup(slave)) };
+    if d0 < 0 || d1 < 0 || d2 < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe {
+            for d in [d0, d1, d2] {
+                if d >= 0 {
+                    libc::close(d);
+                }
+            }
+            libc::close(master);
+            libc::close(slave);
+        }
+        send_error(tx, &format!("failed to dup pty slave: {e}")).await;
+        return Ok(());
+    }
+
+    // Make the child the controlling terminal's session leader (setsid +
+    // TIOCSCTTY) in a pre-exec hook.
     let mut cmd = Command::new(&program);
     cmd.arg0(&arg0).args(&extra);
-    // SAFETY: dup of a live fd; the OwnedFd takes ownership and Command closes it.
+    // SAFETY: d0/d1/d2 are live dups the OwnedFd takes ownership of; Command
+    // closes them. The pre_exec closure runs in the forked child before exec.
     unsafe {
-        cmd.stdin(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave))));
-        cmd.stdout(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave))));
-        cmd.stderr(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave))));
+        cmd.stdin(Stdio::from(OwnedFd::from_raw_fd(d0)));
+        cmd.stdout(Stdio::from(OwnedFd::from_raw_fd(d1)));
+        cmd.stderr(Stdio::from(OwnedFd::from_raw_fd(d2)));
         let ctty = slave;
         cmd.pre_exec(move || {
             if libc::setsid() < 0 {
@@ -378,7 +509,7 @@ where
                 libc::close(master);
                 libc::close(slave);
             }
-            send_error(tx, &format!("failed to spawn pty shell: {e}"));
+            send_error(tx, &format!("failed to spawn pty shell: {e}")).await;
             return Ok(());
         }
     };
@@ -413,7 +544,7 @@ where
             match res {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
-                    if tx_out.send((frame::FRAME_STDOUT, buf[..n].to_vec())).is_err() {
+                    if tx_out.send((frame::FRAME_STDOUT, buf[..n].to_vec())).await.is_err() {
                         break;
                     }
                 }
@@ -436,7 +567,7 @@ where
             // the select below hangs up the shell either way.
             match timeout(idle_timeout, frame::read_frame(reader)).await {
                 Err(_elapsed) => {
-                    cancel.notify_one();
+                    cancel.fire();
                     break;
                 }
                 Ok(Ok(Some(f))) if f.ftype == frame::FRAME_STDIN => {
@@ -461,17 +592,13 @@ where
     // we hang up the shell like a real terminal HUP rather than orphaning it.
     // Disconnect is detected two ways: a clean half-close makes input_task's
     // read return EOF; an abrupt client death (no read EOF delivered) instead
-    // trips `cancel` when the writer fails to push pty output to the dead peer.
-    let early = tokio::select! {
-        _ = &mut input_task => None,
-        s = child.wait() => Some(s),
-        _ = cancel.notified() => None,
-    };
-    let status = match early {
-        Some(s) => s,
-        None => hangup(&mut child).await,
-    };
-    let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+    // trips `cancel` (writer failure or idle timeout).
+    let (status, reason_override): (std::io::Result<std::process::ExitStatus>, &'static str) =
+        tokio::select! {
+            _ = &mut input_task => (hangup(&mut child).await, "disconnected"),
+            s = child.wait() => (s, ""),
+            _ = cancel.wait() => (hangup(&mut child).await, "disconnected"),
+        };
 
     // The child is gone. Unlike a pipe (clean Ok(0) EOF), a pty master does not
     // reliably deliver a read-readiness edge on HUP, so out_task can park on
@@ -480,22 +607,28 @@ where
     if tokio::time::timeout(Duration::from_millis(200), &mut out_task).await.is_err() {
         out_task.abort();
     }
-    let payload = serde_json::to_vec(&serde_json::json!({ "code": code }))?;
-    send(tx, frame::FRAME_EXIT, payload);
+    let (code, reason) = exit_fields(status, reason_override);
+    let payload = serde_json::to_vec(&serde_json::json!({ "code": code, "reason": reason }))?;
+    send(tx, frame::FRAME_EXIT, payload).await;
     Ok(())
 }
 
-/// Terminal hangup: SIGHUP the shell, and escalate to SIGKILL if it lingers.
+/// Terminal hangup: SIGHUP the shell's process group, escalating to SIGKILL if
+/// it lingers. The pty child called `setsid()`, so it leads its own group;
+/// signalling the group (negative pid) hangs up background jobs too, not just
+/// the foreground process.
 async fn hangup(
     child: &mut tokio::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
     if let Some(pid) = child.id() {
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGHUP) };
     }
     match timeout(Duration::from_secs(2), child.wait()).await {
         Ok(s) => s,
         Err(_) => {
-            let _ = child.start_kill();
+            if let Some(pid) = child.id() {
+                unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            }
             child.wait().await
         }
     }
@@ -558,7 +691,7 @@ where
     loop {
         match src.read(&mut buf).await {
             Ok(0) => break,
-            Ok(n) => send(tx, ftype, buf[..n].to_vec()),
+            Ok(n) => send(tx, ftype, buf[..n].to_vec()).await,
             Err(_) => break,
         }
     }
@@ -577,12 +710,17 @@ fn warn_long_command(command: &str) {
         "[IGLOO] warning: long guest command detected; consider putting large ",
         "commands in static_files, init.d, or the shared results directory instead.\n"
     );
-    match std::fs::OpenOptions::new().write(true).open("/dev/ttyS0") {
-        Ok(mut tty) => {
-            let _ = std::io::Write::write_all(&mut tty, warning.as_bytes());
+    // Open/write /dev/ttyS0 on a blocking thread: synchronous file I/O on the
+    // single-threaded runtime would stall every other task (including the
+    // writer draining the client socket) for its duration.
+    tokio::task::spawn_blocking(move || {
+        match std::fs::OpenOptions::new().write(true).open("/dev/ttyS0") {
+            Ok(mut tty) => {
+                let _ = std::io::Write::write_all(&mut tty, warning.as_bytes());
+            }
+            Err(_) => {
+                log::warn!("{}", warning.trim_end());
+            }
         }
-        Err(_) => {
-            log::warn!("{}", warning.trim_end());
-        }
-    }
+    });
 }

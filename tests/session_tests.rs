@@ -14,14 +14,31 @@ struct Collected {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     exit_code: Option<i32>,
+    reason: Option<String>,
     error: Option<String>,
 }
 
 async fn run_exec(cmd: &str, deadline: Option<f64>) -> Collected {
+    run_exec_dd(cmd, deadline, None).await
+}
+
+/// Like `run_exec`, but lets a test set the agent's default command deadline
+/// (the generous cap applied when the request carries no explicit deadline).
+async fn run_exec_dd(
+    cmd: &str,
+    deadline: Option<f64>,
+    default_deadline: Option<std::time::Duration>,
+) -> Collected {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
     let shell = Arc::new("/bin/sh".to_string());
-    let session = tokio::spawn(run_session(g_rd, g_wr, shell, std::time::Duration::from_secs(60)));
+    let session = tokio::spawn(run_session(
+        g_rd,
+        g_wr,
+        shell,
+        std::time::Duration::from_secs(60),
+        default_deadline,
+    ));
 
     let (mut h_rd, mut h_wr) = split(host);
     let mut req = serde_json::json!({ "verb": "exec", "cmd": cmd });
@@ -43,6 +60,7 @@ async fn collect<R: AsyncRead + Unpin>(r: &mut R) -> Collected {
         stdout: Vec::new(),
         stderr: Vec::new(),
         exit_code: None,
+        reason: None,
         error: None,
     };
     while let Some(Frame { ftype, payload }) = frame::read_frame(r).await.unwrap() {
@@ -52,6 +70,7 @@ async fn collect<R: AsyncRead + Unpin>(r: &mut R) -> Collected {
             frame::FRAME_EXIT => {
                 let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
                 out.exit_code = Some(v["code"].as_i64().unwrap() as i32);
+                out.reason = v["reason"].as_str().map(|s| s.to_string());
                 break;
             }
             frame::FRAME_ERROR => {
@@ -101,7 +120,7 @@ async fn stdin_is_forwarded_to_child() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
     let shell = Arc::new("/bin/sh".to_string());
-    let session = tokio::spawn(run_session(g_rd, g_wr, shell, std::time::Duration::from_secs(60)));
+    let session = tokio::spawn(run_session(g_rd, g_wr, shell, std::time::Duration::from_secs(60), None));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "exec", "cmd": "cat" });
@@ -124,8 +143,50 @@ async fn stdin_is_forwarded_to_child() {
 #[tokio::test]
 async fn deadline_kills_a_hung_command() {
     let r = run_exec("sleep 30", Some(0.3)).await;
-    // Killed by SIGTERM -> no clean code; session reports -1.
-    assert_eq!(r.exit_code, Some(-1));
+    // Killed via SIGKILL on the deadline -> conventional 128+9 code and a
+    // distinct "timeout" reason (not just a bare -1, so the client can tell a
+    // timeout apart from a normal exit).
+    assert_eq!(r.reason.as_deref(), Some("timeout"));
+    assert_eq!(r.exit_code, Some(137));
+}
+
+#[tokio::test]
+async fn exit_reason_is_exited_on_normal_exit() {
+    let r = run_exec("exit 3", None).await;
+    assert_eq!(r.exit_code, Some(3));
+    assert_eq!(r.reason.as_deref(), Some("exited"));
+}
+
+#[tokio::test]
+async fn default_deadline_kills_a_runaway_command() {
+    // No per-request deadline, but the agent's generous default still bounds a
+    // wedged command. Reason must say "timeout", distinct from a clean exit.
+    let r = run_exec_dd("sleep 30", None, Some(std::time::Duration::from_millis(300))).await;
+    assert_eq!(r.reason.as_deref(), Some("timeout"));
+    assert_eq!(r.exit_code, Some(137));
+}
+
+#[tokio::test]
+async fn explicit_zero_deadline_opts_out_of_the_default() {
+    // deadline 0 means "no cap" even when a default is set: a fast command runs
+    // to a normal exit rather than being rejected or killed.
+    let r = run_exec_dd("echo ok", Some(0.0), Some(std::time::Duration::from_secs(60))).await;
+    assert_eq!(r.exit_code, Some(0));
+    assert_eq!(r.reason.as_deref(), Some("exited"));
+    assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "ok");
+}
+
+#[tokio::test]
+async fn invalid_deadline_is_rejected() {
+    // A non-finite/negative client-supplied deadline must not panic
+    // Duration::from_secs_f64 -- it is rejected with an ERROR before the
+    // command runs.
+    let r = run_exec("echo nope", Some(-1.0)).await;
+    assert!(
+        r.error.unwrap_or_default().contains("invalid deadline"),
+        "expected an invalid-deadline error"
+    );
+    assert!(r.exit_code.is_none());
 }
 
 #[tokio::test]
@@ -172,7 +233,7 @@ async fn read_until<R: AsyncRead + Unpin>(r: &mut R, needle: &str) -> String {
 async fn open_pty_runs_interactive_shell_with_a_tty() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
-    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60)));
+    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60), None));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "open-pty", "rows": 30, "cols": 100 });
@@ -199,7 +260,7 @@ async fn open_pty_runs_interactive_shell_with_a_tty() {
 async fn open_pty_honors_resize_frame() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
-    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60)));
+    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60), None));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "open-pty", "rows": 24, "cols": 80 });
@@ -225,7 +286,7 @@ async fn open_pty_hangs_up_shell_on_disconnect() {
     // the session must terminate (not orphan the shell / hang on wait).
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
-    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60)));
+    let session = tokio::spawn(run_session(g_rd, g_wr, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60), None));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "open-pty" });
@@ -261,7 +322,7 @@ async fn open_pty_tears_down_on_abrupt_disconnect_via_writer_failure() {
 
     let reader = OnceThenPending { data, pos: 0 };
     let writer = FailingWriter;
-    let session = tokio::spawn(run_session(reader, writer, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60)));
+    let session = tokio::spawn(run_session(reader, writer, Arc::new("/bin/sh".to_string()), std::time::Duration::from_secs(60), None));
 
     let done = tokio::time::timeout(std::time::Duration::from_secs(8), session).await;
     assert!(
@@ -289,6 +350,7 @@ async fn session_times_out_when_client_goes_silent() {
         tokio::io::sink(),
         Arc::new("/bin/sh".to_string()),
         std::time::Duration::from_millis(300),
+        None,
     ));
 
     let done = tokio::time::timeout(std::time::Duration::from_secs(8), session).await;
@@ -353,7 +415,7 @@ async fn unsupported_verb_reports_error() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
     let shell = Arc::new("/bin/sh".to_string());
-    let session = tokio::spawn(run_session(g_rd, g_wr, shell, std::time::Duration::from_secs(60)));
+    let session = tokio::spawn(run_session(g_rd, g_wr, shell, std::time::Duration::from_secs(60), None));
 
     let (mut h_rd, mut h_wr) = split(host);
     let req = serde_json::json!({ "verb": "teleport" });
