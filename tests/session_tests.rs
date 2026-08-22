@@ -357,6 +357,23 @@ async fn session_times_out_when_client_goes_silent() {
     assert!(done.is_ok(), "session did not time out a silent (no-ping) client");
 }
 
+#[tokio::test]
+async fn silent_client_that_sends_no_request_is_dropped() {
+    // A client that connects and then never sends a REQUEST (or dribbles a
+    // partial header and stalls) must not park the session forever -- the
+    // initial read is bounded by idle_timeout, so the session gives up.
+    let reader = OnceThenPending { data: Vec::new(), pos: 0 };
+    let session = tokio::spawn(run_session(
+        reader,
+        tokio::io::sink(),
+        Arc::new("/bin/sh".to_string()),
+        std::time::Duration::from_millis(300),
+        None,
+    ));
+    let done = tokio::time::timeout(std::time::Duration::from_secs(5), session).await;
+    assert!(done.is_ok(), "session did not give up on a silent (no-request) client");
+}
+
 /// AsyncRead that returns its buffer once, then parks forever (never EOF) --
 /// models a vsock whose read side never signals an abrupt peer death.
 struct OnceThenPending {
