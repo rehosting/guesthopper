@@ -11,10 +11,13 @@ The guest never runs sshd and holds no key material: SSH is terminated entirely
 here, on the host side, and only the clean vsock frame protocol crosses into the
 guest. The wire contract (frame types, handshake) is shared with guest_cmd.py.
 
-Auth is OPEN by default (any username, no password/key) to mirror the telnet
-door: access is gated by being able to reach the listener (bound to localhost in
-the container by default), exactly as the serial/telnet console was. Lock it
-down with --authorized-keys if you bind it somewhere reachable.
+Auth is OPEN (any username, no password/key), mirroring the telnet door and the
+serial/telnet console it replaces: access is gated by being able to reach the
+listener. penguin_run binds it on the container's network (0.0.0.0) but publishes
+nothing to the host unless the run adds -p, so it answers on the container IP
+like a real device. There is deliberately no key-auth path yet; if a keyed
+lockdown is ever wanted, add an --authorized-keys arg and have begin_auth return
+True with a validate_public_key implementation.
 
 asyncssh provides the SSH protocol. It is imported lazily/guarded so this module
 (and its frame codec, which is unit-tested) still imports on a host without
