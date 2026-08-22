@@ -26,7 +26,6 @@ import asyncio
 import json
 import sys
 
-import guest_cmd
 from guest_cmd import (
     FRAME_ERROR,
     FRAME_EXIT,
