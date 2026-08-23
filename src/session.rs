@@ -132,6 +132,30 @@ fn exit_fields(
     }
 }
 
+/// Grace for reaping a child we have already signalled. A process wedged in
+/// uninterruptible kernel sleep (state `D`) -- e.g. blocked in a half-implemented
+/// emulated device driver, a real and recurring hazard in firmware rehosting --
+/// cannot be reaped even by SIGKILL, so an unbounded `child.wait()` on it would
+/// park the session task forever and never release its concurrency permit. Every
+/// post-kill wait is bounded by this; if it elapses we detach and let the session
+/// end so the slot is freed (the kernel owns the stuck task's eventual cleanup).
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Wait for an already-signalled child, but never longer than [`REAP_GRACE`].
+/// Returns a synthetic `TimedOut` error (surfaced as EXIT reason "error") rather
+/// than blocking the session forever on a `D`-state child.
+async fn reap_bounded(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    match timeout(REAP_GRACE, child.wait()).await {
+        Ok(s) => s,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "child did not exit after kill (stuck in uninterruptible sleep?)",
+        )),
+    }
+}
+
 /// SIGKILL the child's whole process group (negative pid). `exec` spawns the
 /// child with `process_group(0)`, so this reaps `cmd &` grandchildren too, not
 /// just the shell -- otherwise they are reparented to init and survive. A
@@ -369,8 +393,26 @@ where
                     }
                     Ok(Ok(Some(f))) if f.ftype == frame::FRAME_STDIN => {
                         if let Some(si) = cstdin.as_mut() {
-                            if si.write_all(&f.payload).await.is_err() {
-                                break;
+                            // Bound the write into the child's stdin. If the child
+                            // stops draining its stdin, a client that floods more
+                            // than one pipe buffer (~64 KiB) would otherwise park
+                            // this task inside `write_all` with no backstop armed:
+                            // idle_timeout only wraps the read above, the writer's
+                            // write_timeout only fires while the writer is actually
+                            // writing (it sits idle when the child is silent), and
+                            // with `deadline: 0` there is no deadline either -- so
+                            // the session would run forever and never release its
+                            // permit. Cap the stall and, on a lapse, treat the peer
+                            // as gone/wedged and tear down (biased on cancel so a
+                            // concurrent teardown wins immediately).
+                            tokio::select! {
+                                biased;
+                                _ = cancel.wait() => break,
+                                r = timeout(idle_timeout, si.write_all(&f.payload)) => match r {
+                                    Err(_elapsed) => { cancel.fire(); break; }
+                                    Ok(Err(_)) => break, // child closed its stdin
+                                    Ok(Ok(())) => {}
+                                }
                             }
                         }
                     }
@@ -378,8 +420,23 @@ where
                         cstdin = None; // drop -> close child's stdin
                     }
                     Ok(Ok(Some(_))) => {} // PING / unknown frames: just liveness
-                    Ok(Ok(None)) => break, // host closed its write half
-                    Ok(Err(_)) => break,
+                    // A transport read EOF/error means the client's whole
+                    // connection dropped -- the protocol signals a *stdin*
+                    // half-close with an explicit FRAME_STDIN_EOF (handled above)
+                    // and never closes the socket for that, so this is a genuine
+                    // disconnect. Fire cancel to tear the command down like the
+                    // pty path hangs up its shell. Without this a *silent*
+                    // long-running command (no output, deadline 0) is orphaned:
+                    // the writer never notices the dead peer (it never writes) and
+                    // there is no deadline, so nothing else would ever reap it.
+                    Ok(Ok(None)) => {
+                        cancel.fire();
+                        break;
+                    }
+                    Ok(Err(_)) => {
+                        cancel.fire();
+                        break;
+                    }
                 }
             }
         }
@@ -410,12 +467,28 @@ where
                 biased;
                 _ = cancel.wait() => {
                     // Peer gone (writer failed, or no frame within idle_timeout).
+                    // Bound the reap: a killed-but-D-state child must not park the
+                    // session (and leak its permit) forever.
                     kill_group(child_pid);
-                    break ((&mut wait).await, "disconnected");
+                    let s = match timeout(REAP_GRACE, &mut wait).await {
+                        Ok(s) => s,
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "child did not exit after kill",
+                        )),
+                    };
+                    break (s, "disconnected");
                 }
                 _ = &mut deadline_timer => {
                     kill_group(child_pid);
-                    break ((&mut wait).await, "timeout");
+                    let s = match timeout(REAP_GRACE, &mut wait).await {
+                        Ok(s) => s,
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "child did not exit after kill",
+                        )),
+                    };
+                    break (s, "timeout");
                 }
                 status = &mut wait => {
                     break (status, "");
@@ -580,7 +653,7 @@ where
     // where master is still a raw fd) close master before bailing.
     if let Err(e) = set_nonblocking(master) {
         kill_group(child.id());
-        let _ = child.wait().await;
+        let _ = reap_bounded(&mut child).await;
         unsafe { libc::close(master) };
         send_error(tx, &format!("failed to set pty master non-blocking: {e}")).await;
         return Ok(());
@@ -591,7 +664,7 @@ where
         Ok(a) => Arc::new(a),
         Err(e) => {
             kill_group(child.id());
-            let _ = child.wait().await;
+            let _ = reap_bounded(&mut child).await;
             send_error(tx, &format!("failed to register pty master with the runtime: {e}")).await;
             return Ok(());
         }
@@ -647,8 +720,21 @@ where
                     break;
                 }
                 Ok(Ok(Some(f))) if f.ftype == frame::FRAME_STDIN => {
-                    if write_all_fd(&am_write, &f.payload).await.is_err() {
-                        break;
+                    // Bound the write to the pty master. If the shell (or its
+                    // foreground child) stops reading its tty, the master write
+                    // buffer fills and a flooding client parks this task inside
+                    // `write_all_fd` forever. open_pty has NO deadline timer, so
+                    // unlike exec there is not even a slow self-heal: the session
+                    // would leak its permit permanently. Cap the stall and treat a
+                    // lapse as a dead/wedged peer (biased on cancel).
+                    tokio::select! {
+                        biased;
+                        _ = cancel.wait() => break,
+                        r = timeout(idle_timeout, write_all_fd(&am_write, &f.payload)) => match r {
+                            Err(_elapsed) => { cancel.fire(); break; }
+                            Ok(Err(_)) => break,
+                            Ok(Ok(())) => {}
+                        }
                     }
                 }
                 Ok(Ok(Some(f))) if f.ftype == frame::FRAME_RESIZE => {
@@ -705,7 +791,9 @@ async fn hangup(
             if let Some(pid) = child.id() {
                 unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
             }
-            child.wait().await
+            // Bounded: a D-state child that ignores even SIGKILL must not park
+            // the session (and leak its permit) here forever.
+            reap_bounded(child).await
         }
     }
 }

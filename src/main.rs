@@ -86,6 +86,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("Session write timeout: {}s", write_timeout.as_secs());
 
+    // Cap the largest inbound frame the agent will allocate for. The default is
+    // modest (see frame::DEFAULT_MAX_INBOUND_FRAME_LEN) so a hostile peer cannot
+    // drive a big allocation per session and OOM a scarce-RAM guest; operators on
+    // especially tiny guests can lower it, and anyone streaming large stdin
+    // chunks can raise it (clamped to the u32 hard ceiling). Set once here,
+    // before the accept loop, so every session sees the same limit.
+    if let Some(v) = std::env::var("GUESTHOPPER_MAX_FRAME_LEN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        guesthopper::frame::set_max_inbound_frame_len(v);
+    }
+    info!(
+        "Max inbound frame: {} bytes",
+        guesthopper::frame::max_inbound_frame_len()
+    );
+
     // Cap concurrent sessions. Each session forks a real shell and holds a vsock
     // fd + two tasks, so an unbounded accept loop is a fork/fd-exhaustion vector
     // for a confused or malicious client. Acquire a permit *before* accepting so

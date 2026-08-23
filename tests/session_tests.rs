@@ -476,6 +476,112 @@ impl tokio::io::AsyncWrite for FailingWriter {
 }
 
 #[tokio::test]
+async fn exec_silent_command_is_reaped_on_client_disconnect() {
+    // A silent long-running command with deadline 0 (uncapped) must still be torn
+    // down when the client's connection drops. The client half-closes its write
+    // side so the guest reader sees EOF; because the command produces no output
+    // the writer never notices the dead peer and (deadline 0) there is no
+    // deadline, so only the EOF-driven cancel can reap it. Without that a silent
+    // command orphans and its session permit leaks forever.
+    let (host, guest) = duplex(1 << 16);
+    let (g_rd, g_wr) = split(guest);
+    let session = tokio::spawn(run_session(
+        g_rd,
+        g_wr,
+        Arc::new("/bin/sh".to_string()),
+        std::time::Duration::from_secs(60), // idle: long, NOT what fires
+        std::time::Duration::from_secs(60), // write: long, NOT what fires
+        None,
+    ));
+    // Keep the host read half alive (named binding, not dropped) so a closed
+    // read half can't be what reaps the session -- only the EOF cancel can.
+    let (_h_rd, mut h_wr) = split(host);
+    let req = serde_json::json!({ "verb": "exec", "cmd": "sleep 100", "deadline": 0 });
+    frame::write_frame(&mut h_wr, frame::FRAME_REQUEST, &serde_json::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    // Client disconnects: half-close the write side -> guest reader sees EOF.
+    h_wr.shutdown().await.unwrap();
+    let done = tokio::time::timeout(std::time::Duration::from_secs(6), session).await;
+    assert!(
+        done.is_ok(),
+        "silent command was not reaped when the client disconnected"
+    );
+}
+
+#[tokio::test]
+async fn exec_stdin_flood_to_nondraining_child_tears_down() {
+    // The inbound-to-child twin of the writer-stall DoS. A command that never
+    // reads its stdin (`sleep`) is started with deadline 0 (uncapped, so the
+    // command deadline cannot be what ends it); the client then floods more than
+    // one pipe buffer of stdin and goes quiet. The write into the child's stdin
+    // pipe would otherwise park stdin_task forever -- idle_timeout only wrapped
+    // the read, the writer sits idle (child is silent) so write_timeout never
+    // arms, and deadline 0 means no deadline. The idle-bounded child-stdin write
+    // must fire and tear the session down so its permit is released.
+    let (host, guest) = duplex(1 << 20);
+    let (g_rd, g_wr) = split(guest);
+    let session = tokio::spawn(run_session(
+        g_rd,
+        g_wr,
+        Arc::new("/bin/sh".to_string()),
+        std::time::Duration::from_millis(300), // idle: the backstop under test
+        std::time::Duration::from_secs(60),    // write: long, NOT what fires
+        None,
+    ));
+
+    let (_h_rd, mut h_wr) = split(host);
+    let req = serde_json::json!({ "verb": "exec", "cmd": "sleep 100", "deadline": 0 });
+    frame::write_frame(&mut h_wr, frame::FRAME_REQUEST, &serde_json::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    // More than one pipe buffer (~64 KiB) to a child that never drains it.
+    let big = vec![0u8; 512 * 1024];
+    frame::write_frame(&mut h_wr, frame::FRAME_STDIN, &big).await.unwrap();
+    // Never read, never send again: only the idle-bounded child-stdin write can
+    // end this session.
+    let done = tokio::time::timeout(std::time::Duration::from_secs(6), session).await;
+    assert!(
+        done.is_ok(),
+        "session did not tear down when the child stopped draining stdin"
+    );
+}
+
+#[tokio::test]
+async fn open_pty_stdin_flood_to_nonreading_shell_tears_down() {
+    // The pty counterpart, and worse: open_pty has NO deadline timer, so a client
+    // that floods the pty master while the shell isn't reading (here: a large
+    // no-newline blob that fills the canonical tty input buffer) would park
+    // input_task in write_all_fd forever with no self-heal at all. The
+    // idle-bounded master write must fire and hang up the shell.
+    let (host, guest) = duplex(1 << 20);
+    let (g_rd, g_wr) = split(guest);
+    let session = tokio::spawn(run_session(
+        g_rd,
+        g_wr,
+        Arc::new("/bin/sh".to_string()),
+        std::time::Duration::from_millis(300), // idle: the backstop under test
+        std::time::Duration::from_secs(60),
+        None,
+    ));
+
+    let (_h_rd, mut h_wr) = split(host);
+    let req = serde_json::json!({ "verb": "open-pty" });
+    frame::write_frame(&mut h_wr, frame::FRAME_REQUEST, &serde_json::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    // No newline: in canonical mode the shell's read() never returns, so the tty
+    // input buffer fills and further master writes block.
+    let big = vec![b'x'; 512 * 1024];
+    frame::write_frame(&mut h_wr, frame::FRAME_STDIN, &big).await.unwrap();
+    let done = tokio::time::timeout(std::time::Duration::from_secs(6), session).await;
+    assert!(
+        done.is_ok(),
+        "pty session did not tear down when the shell stopped reading its tty"
+    );
+}
+
+#[tokio::test]
 async fn unsupported_verb_reports_error() {
     let (host, guest) = duplex(1 << 20);
     let (g_rd, g_wr) = split(guest);
