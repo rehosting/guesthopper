@@ -6,6 +6,8 @@
 //! small JSON object. This replaces the old one-shot 64 KB / `from_utf8_lossy`
 //! path, which could neither stream nor carry binary data.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Host -> guest.
@@ -27,9 +29,54 @@ pub const FRAME_STDERR: u8 = 17;
 pub const FRAME_EXIT: u8 = 18;
 pub const FRAME_ERROR: u8 = 19;
 
-/// Upper bound on a single frame's payload, to cap the allocation a peer can
-/// force. 16 MiB comfortably clears any control JSON or reasonable I/O chunk.
+/// Absolute hard ceiling on a frame payload. The wire length is a `u32`, so this
+/// also guards `write_frame`'s `as u32` cast against silent truncation. The
+/// *inbound* accept limit is separate and normally much smaller (see
+/// [`max_inbound_frame_len`]); this is only the ceiling that limit may be raised
+/// to.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// Default cap on a single *inbound* frame the agent will allocate for. A hostile
+/// or buggy peer can otherwise make the agent `vec![0u8; len]` up to the header's
+/// advertised length for every concurrent session at once; at the old 16 MiB that
+/// was ~1 GiB across the default 64 sessions -- and a single 16 MiB frame alone
+/// can OOM a 32 MiB firmware guest. Real inbound frames are tiny (keystrokes, a
+/// resize JSON, an exec string, or a <=32 KiB stdin chunk), so 1 MiB is ~16x
+/// headroom over anything legitimate while shrinking the worst case ~16x.
+pub const DEFAULT_MAX_INBOUND_FRAME_LEN: usize = 1024 * 1024;
+
+/// Floor for the configurable inbound cap: still comfortably clears any control
+/// JSON and a full stdin chunk, so a mis-set tiny value can't wedge legitimate
+/// use.
+pub const MIN_INBOUND_FRAME_LEN: usize = 64 * 1024;
+
+/// The live inbound cap, set once at startup from the environment (see
+/// `main.rs`). An `AtomicUsize` rather than a threaded parameter because it is a
+/// genuinely process-global limit; `read_frame` reads it with `Relaxed` ordering
+/// (a stale read is harmless -- it is only ever set before any session accepts).
+static MAX_INBOUND_FRAME_LEN: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_INBOUND_FRAME_LEN);
+
+// Compile-time invariants: the default must sit within the clamp bounds.
+const _: () = assert!(DEFAULT_MAX_INBOUND_FRAME_LEN >= MIN_INBOUND_FRAME_LEN);
+const _: () = assert!(DEFAULT_MAX_INBOUND_FRAME_LEN <= MAX_FRAME_LEN);
+
+/// Clamp a requested cap to `[MIN_INBOUND_FRAME_LEN, MAX_FRAME_LEN]`. Pure so it
+/// is testable without touching the shared global.
+fn clamp_inbound(v: usize) -> usize {
+    v.clamp(MIN_INBOUND_FRAME_LEN, MAX_FRAME_LEN)
+}
+
+/// Set the inbound frame cap, clamped so neither a hostile-small nor an
+/// overflowing value can be installed. Call once at startup, before accepting
+/// connections.
+pub fn set_max_inbound_frame_len(v: usize) {
+    MAX_INBOUND_FRAME_LEN.store(clamp_inbound(v), Ordering::Relaxed);
+}
+
+/// The current inbound frame cap.
+pub fn max_inbound_frame_len() -> usize {
+    MAX_INBOUND_FRAME_LEN.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -48,10 +95,11 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opti
     }
     let ftype = hdr[0];
     let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
-    if len > MAX_FRAME_LEN {
+    let cap = max_inbound_frame_len();
+    if len > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("frame payload {len} exceeds MAX_FRAME_LEN {MAX_FRAME_LEN}"),
+            format!("frame payload {len} exceeds inbound cap {cap}"),
         ));
     }
     let mut payload = vec![0u8; len];
@@ -116,6 +164,37 @@ mod tests {
         // No further frame written -> clean EOF is None, not an error.
         drop(a_rd);
         assert!(read_frame(&mut b_rd).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn inbound_cap_is_clamped_to_sane_bounds() {
+        // A hostile-small request is floored (can't wedge legitimate frames);
+        // an overflowing request is capped at the hard ceiling; an in-range
+        // value passes through.
+        assert_eq!(clamp_inbound(0), MIN_INBOUND_FRAME_LEN);
+        assert_eq!(clamp_inbound(1), MIN_INBOUND_FRAME_LEN);
+        assert_eq!(clamp_inbound(usize::MAX), MAX_FRAME_LEN);
+        assert_eq!(clamp_inbound(2 * 1024 * 1024), 2 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn frame_over_default_inbound_cap_is_rejected() {
+        // A header advertising 2 MiB -- well under the 16 MiB hard ceiling but
+        // over the 1 MiB default inbound cap -- must be refused, not allocated.
+        // (Uses the default cap so it never mutates the shared global and stays
+        // parallel-safe with other tests.)
+        let (a, b) = tokio::io::duplex(64);
+        let (_a_rd, mut a_wr) = tokio::io::split(a);
+        let (mut b_rd, _b_wr) = tokio::io::split(b);
+        let mut hdr = [0u8; 5];
+        hdr[0] = FRAME_STDIN;
+        hdr[1..5].copy_from_slice(&(2u32 * 1024 * 1024).to_be_bytes());
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = a_wr.write_all(&hdr).await;
+        });
+        let err = read_frame(&mut b_rd).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
