@@ -64,6 +64,8 @@
       #   guesthopper/guesthopper.<penguinName>            per-arch binary
       #   guesthopper/guesthopper.<compat> -> canonical    legacy arch-name aliases
       #   guesthopper/guest_cmd.py                         host-side client (arch-independent)
+      #   guesthopper/telnet_gateway.py                    host-side telnet front door (arch-independent)
+      #   guesthopper/ssh_gateway.py                       host-side SSH front door (arch-independent)
       dist = pkgs.runCommand "guesthopper-dist"
         {
           nativeBuildInputs = with pkgs.buildPackages; [ coreutils ];
@@ -92,6 +94,13 @@
           # Host-side client (arch-independent), read by penguin at
           # /igloo_static/guesthopper/guest_cmd.py.
           cp ${self}/guest_cmd.py "$out/guesthopper/guest_cmd.py"
+          # Host-side telnet front door (imports guest_cmd, so it must sit
+          # beside it). Penguin runs it at /igloo_static/guesthopper/telnet_gateway.py.
+          cp ${self}/telnet_gateway.py "$out/guesthopper/telnet_gateway.py"
+          # Host-side SSH front door (also imports guest_cmd; needs asyncssh in
+          # penguin's python env). Penguin runs it at
+          # /igloo_static/guesthopper/ssh_gateway.py.
+          cp ${self}/ssh_gateway.py "$out/guesthopper/ssh_gateway.py"
 
           chmod -R u+w "$out"
         '';

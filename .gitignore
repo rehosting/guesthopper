@@ -1,0 +1,13 @@
+# Rust build output (local `cargo` builds; CI/release build via nix)
+/target
+
+# nix build outputs
+/result
+/result-*
+
+# `nix build .#dist` output copied into the tree
+/guesthopper/
+
+# Python bytecode caches (host-side gateways + tests)
+__pycache__/
+*.pyc

@@ -1,33 +1,15 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{timeout, Duration};
-use tokio_vsock::{VsockListener,VsockAddr, VsockStream};
-use tokio::process::Command;
-use std::process::Stdio;
+use tokio_vsock::{VsockListener, VsockAddr};
 use structopt::StructOpt;
-use log::{info,warn,error};
+use log::{info, warn, error};
 use env_logger;
-use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use serde::{Serialize, Deserialize};
-use serde_json;
-use shlex;
-mod portalcall;
 
+use guesthopper::session::run_session;
+
+mod portalcall;
 use portalcall::{URegSize, RegSize};
 
-const BUF_SIZE: usize = 65536;
-const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const INDIV_DEBUG_PORTALCALL_MAGIC: URegSize = 0xfeedbeef;
-const LONG_COMMAND_THRESHOLD: usize = 2048;
-static LONG_COMMAND_WARNED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Serialize, Deserialize, Debug)]
-struct CmdResult {
-    stdout: String,
-    stderr: String,
-    exit_code: i32,
-}
 
 #[derive(Clone, StructOpt)]
 pub struct ListenAddress {
@@ -42,7 +24,12 @@ pub struct ListenAddress {
     shell: Option<String>,
 }
 
-#[tokio::main]
+// A current-thread runtime: the guest is typically one emulated vCPU, so a
+// multi-threaded work-stealing scheduler is pure emulated overhead (worker
+// threads, cross-thread wakeups). tokio::spawn still works -- tasks are
+// cooperatively scheduled on the single thread. Keeps guest CPU near zero when
+// idle (blocked on accept/epoll) and lean under load.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
@@ -50,107 +37,154 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ListenAddress::from_args();
     let cid = args.cid.unwrap_or(libc::VMADDR_CID_ANY);
     let addr = VsockAddr::new(cid, args.port);
-    let mut listener = VsockListener::bind(addr)?;
+    let listener = VsockListener::bind(addr)?;
 
     warn!("Listening on VSOCK cid: {}, port: {}", cid, args.port);
 
     let shell = Arc::new(args.shell.unwrap_or_else(
-        || match std::fs::read_link("/igloo/utils/sh.orig")  {
-            Ok(resolved_path) => resolved_path.to_str().unwrap().to_string(),
-            Err(_) => "/bin/sh".to_string()
-        }
+        || match std::fs::read_link("/igloo/utils/sh.orig") {
+            // Lossy rather than `.unwrap()`: a non-UTF-8 symlink target must not
+            // panic the agent before it ever accepts a connection.
+            Ok(resolved_path) => resolved_path.to_string_lossy().into_owned(),
+            Err(_) => "/bin/sh".to_string(),
+        },
     ));
 
     info!("Running commands with {}", shell);
 
+    // A session with no frame (not even a keepalive PING) for this long is
+    // treated as a dead client and torn down -- the backstop for an abrupt
+    // disconnect the vsock transport doesn't surface as EOF/error. Generous by
+    // default (guest time runs slow under emulation and the client PINGs every
+    // few seconds); override with GUESTHOPPER_IDLE_TIMEOUT_SECS.
+    let idle_timeout = std::time::Duration::from_secs(
+        std::env::var("GUESTHOPPER_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            // Floor at 1s: a 0 would make every read time out instantly and
+            // kill every command the moment it goes idle.
+            .unwrap_or(30)
+            .max(1),
+    );
+    info!("Session idle timeout: {}s", idle_timeout.as_secs());
+
+    // Bound on how long a single frame write to the client may stall before the
+    // session is torn down. This is the backstop for a peer that stays *alive
+    // but stops reading* -- it keeps its write half active (PINGs), so the idle
+    // timeout never trips, while our writes block on a full send buffer. Without
+    // it that one client parks the writer forever and its session never releases
+    // its slot, so max_sessions of them wedge the agent. Generous by default
+    // (guest time runs slow under emulation); override with
+    // GUESTHOPPER_WRITE_TIMEOUT_SECS.
+    let write_timeout = std::time::Duration::from_secs(
+        std::env::var("GUESTHOPPER_WRITE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            // Floor at 1s: a 0 would make every write time out instantly.
+            .unwrap_or(60)
+            .max(1),
+    );
+    info!("Session write timeout: {}s", write_timeout.as_secs());
+
+    // Cap the largest inbound frame the agent will allocate for. The default is
+    // modest (see frame::DEFAULT_MAX_INBOUND_FRAME_LEN) so a hostile peer cannot
+    // drive a big allocation per session and OOM a scarce-RAM guest; operators on
+    // especially tiny guests can lower it, and anyone streaming large stdin
+    // chunks can raise it (clamped to the u32 hard ceiling). Set once here,
+    // before the accept loop, so every session sees the same limit.
+    if let Some(v) = std::env::var("GUESTHOPPER_MAX_FRAME_LEN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        guesthopper::frame::set_max_inbound_frame_len(v);
+    }
+    info!(
+        "Max inbound frame: {} bytes",
+        guesthopper::frame::max_inbound_frame_len()
+    );
+
+    // Cap concurrent sessions. Each session forks a real shell and holds a vsock
+    // fd + two tasks, so an unbounded accept loop is a fork/fd-exhaustion vector
+    // for a confused or malicious client. Acquire a permit *before* accepting so
+    // excess connections wait in the kernel backlog rather than being served.
+    let max_sessions: usize = std::env::var("GUESTHOPPER_MAX_SESSIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1);
+    info!("Max concurrent sessions: {}", max_sessions);
+    let sessions = Arc::new(tokio::sync::Semaphore::new(max_sessions));
+
+    // Generous default cap on a single `exec` command: absent a per-request
+    // deadline, a wedged command is killed after this long so it can't run
+    // forever. A client opts a specific command out with deadline 0 (see
+    // guest_cmd.py --timeout 0). Set GUESTHOPPER_COMMAND_TIMEOUT_SECS=0 to
+    // disable the default entirely. Guest time runs slow under emulation, so an
+    // hour of guest wall-clock is very generous.
+    let default_deadline = {
+        let secs: f64 = std::env::var("GUESTHOPPER_COMMAND_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600.0);
+        if secs <= 0.0 {
+            None
+        } else {
+            // Fallible conversion: an absurd operator-set value (e.g. 1e300)
+            // must not panic the agent at startup. Fall back to 1h if it won't
+            // fit a Duration.
+            Some(
+                std::time::Duration::try_from_secs_f64(secs)
+                    .unwrap_or_else(|_| std::time::Duration::from_secs(3600)),
+            )
+        }
+    };
+    match default_deadline {
+        Some(d) => info!("Default command timeout: {}s (per-command deadline 0 opts out)", d.as_secs()),
+        None => info!("Default command timeout: disabled"),
+    }
+
     loop {
-        // Accept an incoming connection
-        let (vsock, addr) = listener.accept().await?;
+        // Block until a session slot is free, so we never accept beyond the cap.
+        // The semaphore is never closed, so this only errors if the runtime is
+        // shutting down -- treat that as "stop accepting".
+        let permit = match Arc::clone(&sessions).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        // Accept an incoming connection. The vsock transport already gives one
+        // independent stream per CONNECT, so each accepted stream is one
+        // session -- we split it into read/write halves and hand it off.
+        let (vsock, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A transient accept error (fd pressure, an aborted connection)
+                // must not tear down the whole agent for the rest of the run;
+                // log it, drop the permit, and keep serving.
+                error!("accept failed: {}", e);
+                drop(permit);
+                continue;
+            }
+        };
+        info!("Received connection from {}", addr);
         let shell_clone = Arc::clone(&shell);
-        tokio::spawn(async move { 
-            if let Err(e) = process_request(vsock, addr, shell_clone).await {
-                error!("Error: {}", e);
+        tokio::spawn(async move {
+            // Hold the permit for the whole session; dropped on task exit,
+            // releasing the slot.
+            let _permit = permit;
+            let (reader, writer) = tokio::io::split(vsock);
+            if let Err(e) = run_session(
+                reader,
+                writer,
+                shell_clone,
+                idle_timeout,
+                write_timeout,
+                default_deadline,
+            )
+            .await
+            {
+                error!("Session error from {}: {}", addr, e);
             }
         });
     }
-}
-
-async fn process_request(mut vsock: VsockStream, addr: VsockAddr, shell: Arc<String>) -> Result<(), Box<dyn Error>> {
-    info!("Received connection from {}",addr);
-
-    let mut buffer = [0; BUF_SIZE];
-    let n = vsock.read(&mut buffer).await?;
-    let command = String::from_utf8_lossy(&buffer[..n]);
-
-    let command = command.trim();
-    info!("Received command: {}", command);
-    warn_long_command_to_console(command);
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    let mut exit_code = 0;
-
-    if let Some((program, args)) = shlex::split(&shell).unwrap().split_first() {
-        //If our program isn't a shell, let's run the shell (this is for busybox)
-        let arg0 = if program.ends_with("sh") { program } else { "sh" };
-
-        info!("Running command in program '{}' (argv[0]={}) with args '{}'", program, arg0, args.join(" "));
-
-        let mut child = Command::new(program)
-            .arg0(arg0)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()) // Could Stdio::inherit() if we wanted to combine streams
-            .spawn()?;
-
-        let _ = timeout(CMD_TIMEOUT, async {
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(&format!("{}\n", command).into_bytes())
-                .await.unwrap();
-                stdin.write_all(b"exit $?\n")
-                .await.unwrap();
-            }
-
-            let status = child.wait().await.unwrap();
-            exit_code = status.code().unwrap();
-            child.stdout.unwrap().read_to_string(&mut stdout).await.unwrap();
-            child.stderr.unwrap().read_to_string(&mut stderr).await.unwrap();
-        }).await;
-    }
-
-    let result = CmdResult {
-        stdout: stdout,
-        stderr: stderr,
-        exit_code: exit_code
-    };
-
-    let serialized = serde_json::to_string(&result)?;
-
-    vsock.write_all(serialized.as_bytes()).await?;
-    vsock.shutdown(std::net::Shutdown::Both)?;
-
     Ok(())
-}
-
-fn warn_long_command_to_console(command: &str) {
-    if command.len() < LONG_COMMAND_THRESHOLD {
-        return;
-    }
-    if LONG_COMMAND_WARNED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let warning = concat!(
-        "[IGLOO] warning: long guest_cmd detected; consider putting large commands ",
-        "in static_files, init.d, or the shared results directory instead.\n"
-    );
-    match std::fs::OpenOptions::new().write(true).open("/dev/ttyS0") {
-        Ok(mut tty) => {
-            let _ = std::io::Write::write_all(&mut tty, warning.as_bytes());
-        }
-        Err(_) => {
-            warn!("{}", warning.trim_end());
-        }
-    }
 }
