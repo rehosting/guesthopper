@@ -1,5 +1,6 @@
 import socket
 import argparse
+import shlex
 import struct
 import sys
 import json
@@ -387,6 +388,31 @@ def _safe_resize(sock, rows, cols):
 
 
 def main(argv=None):
+    return _run_cli(argv)
+
+
+def _assemble_command(command):
+    """Turn the parsed ``command`` REMAINDER into the string the guest runs.
+
+    The guest always executes the result via ``sh -c``. We support two calling
+    styles so both an interactive user and internal callers get what they mean:
+
+    * ONE argument -> a shell command line, used verbatim. This keeps the
+      familiar ``connect.sh "test -f /x"`` / ``guest_cmd "a | b"`` form working
+      and lets callers (vpn source-spoofing, indiv_debug's trace scripts) pass a
+      whole multi-line script as a single string.
+    * MANY arguments -> an argv, like ``docker exec``: each word is shell-quoted
+      before joining, so quoting/spaces survive the round trip
+      (``echo "a b"`` reaches the guest as one argument, ``sh -c 'echo hi'``
+      runs as written). Shell metacharacters that span argv words are literal;
+      use an explicit ``sh -c '...'`` for pipes/redirection there.
+    """
+    if len(command) == 1:
+        return command[0]
+    return " ".join(shlex.quote(word) for word in command)
+
+
+def _run_cli(argv):
     parser = argparse.ArgumentParser(description="Run a command in a rehosted guest")
 
     parser.add_argument("--socket",
@@ -414,7 +440,11 @@ def main(argv=None):
 
     parser.add_argument("command",
                         nargs=argparse.REMAINDER,
-                        help="The command to run on the server.")
+                        help="The command to run on the guest. A SINGLE argument is a "
+                        "shell command line (e.g. 'a | b > c'); MULTIPLE arguments are "
+                        "an argv, like `docker exec` -- each is preserved verbatim, so "
+                        "`echo \"a b\"` reaches the guest as one argument. Use an "
+                        "explicit `sh -c '...'` for pipes/redirection across argv words.")
 
     args = parser.parse_args(argv)
 
@@ -425,7 +455,7 @@ def main(argv=None):
         unix_socket = args.socket if args.socket is not None else find_vsocket()
         if args.shell:
             return run_shell(unix_socket, args.port)
-        command = " ".join(args.command)
+        command = _assemble_command(args.command)
         run_guest(unix_socket, args.port, command, deadline=args.timeout)
     except GuestCommandError as e:
         print(f"guest_cmd: {e}", file=sys.stderr)
