@@ -27,6 +27,7 @@ import select
 import socket
 import sys
 import threading
+import time
 
 import guest_cmd
 from guest_cmd import (
@@ -59,6 +60,12 @@ DONT = 254
 OPT_ECHO = 1    # RFC 857
 OPT_SGA = 3     # Suppress Go Ahead (RFC 858): character-at-a-time mode.
 OPT_NAWS = 31   # Negotiate About Window Size (RFC 1073).
+
+# Cap the subnegotiation accumulator so a client that sends `IAC SB` and then
+# never sends the closing `IAC SE` can't grow gateway memory without bound. NAWS
+# is 4 payload bytes; anything approaching this is already malformed, so past the
+# cap we drop the extra bytes and keep scanning for `IAC SE` to resync.
+MAX_SUBNEG_LEN = 8192
 
 # We echo and suppress-go-ahead on the server side so the client sends keystrokes
 # immediately (no local line editing/echo) and the guest pty does the echoing,
@@ -128,8 +135,9 @@ class TelnetInbound:
             elif self._state == "sb":
                 if b == IAC:
                     self._state = "sb_iac"
-                else:
+                elif len(self._sb) < MAX_SUBNEG_LEN:
                     self._sb.append(b)
+                # else: buffer full -> drop the byte, stay in "sb" until IAC SE.
             elif self._state == "sb_iac":
                 if b == SE:
                     self._end_subneg(resizes)
@@ -227,6 +235,16 @@ def bridge(tcp_conn, unix_socket, port):
 
 
 def _serve_client(tcp_conn, addr, unix_socket, port):
+    # Bound every client-side send/recv. Without this, a client that stops
+    # reading (fills its TCP receive window) but keeps the socket open parks this
+    # thread forever inside `sendall` when the guest produces output -- select()
+    # can't help since we're blocked in a write, not a read -- pinning the guest
+    # pty session, thread, and fd. Repeated, that exhausts the agent's session
+    # cap. The timeout surfaces as OSError, handled below as a disconnect.
+    try:
+        tcp_conn.settimeout(FRAME_READ_TIMEOUT_S)
+    except OSError:
+        pass
     try:
         bridge(tcp_conn, unix_socket, port)
     except (OSError, GuestCommandError) as e:
@@ -256,7 +274,16 @@ def serve(listen_host, listen_port, unix_socket, port):
             file=sys.stderr,
         )
         while True:
-            conn, addr = srv.accept()
+            try:
+                conn, addr = srv.accept()
+            except OSError as e:
+                # A transient accept error (ECONNABORTED) or fd exhaustion
+                # (EMFILE/ENFILE) must not kill the listener for everyone. Pause
+                # briefly so a sustained EMFILE can't spin the CPU on the single
+                # emulated vCPU while fds drain.
+                print(f"telnet_gateway: accept failed: {e}", file=sys.stderr)
+                time.sleep(0.1)
+                continue
             # One thread per client; the guest supports concurrent sessions
             # (bounded by the agent's own session cap).
             t = threading.Thread(

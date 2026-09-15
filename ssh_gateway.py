@@ -42,8 +42,17 @@ from guest_cmd import (
     MAX_FRAME_LEN,
     PING_INTERVAL_S,
     GuestCommandError,
+    _parse_json,
     find_vsocket,
 )
+
+# SSH->guest inbound backpressure: when the queue of not-yet-forwarded client
+# events reaches the high-water mark (the guest/vsock side has stalled and isn't
+# draining) we pause reading the SSH channel, and resume once it drains below the
+# low-water mark. This bounds gateway memory instead of buffering a flooding
+# client without limit.
+INBOUND_HIGH_WATER = 1024
+INBOUND_LOW_WATER = 256
 
 try:
     import asyncssh
@@ -127,6 +136,13 @@ if asyncssh is not None:
             # SSH-side events can arrive before the vsock is connected; queue them.
             self._inbound = asyncio.Queue()
             self._tasks = []
+            self._reading_paused = False
+            # Set == the SSH client is keeping up with guest output. asyncssh
+            # clears it via pause_writing() when its outbound buffer to the client
+            # fills, so _pump_outbound stops reading guest frames rather than
+            # buffering without bound when the client stops reading.
+            self._write_resumed = asyncio.Event()
+            self._write_resumed.set()
 
         # -- asyncssh callbacks --
         def connection_made(self, chan):
@@ -152,14 +168,35 @@ if asyncssh is not None:
             return True
 
         def terminal_size_changed(self, width, height, pixwidth, pixheight):
-            self._inbound.put_nowait(("resize", (height, width)))
+            self._enqueue(("resize", (height, width)))
 
         def data_received(self, data, datatype):
-            self._inbound.put_nowait(("data", data))
+            self._enqueue(("data", data))
 
         def eof_received(self):
-            self._inbound.put_nowait(("eof", None))
+            self._enqueue(("eof", None))
             return True  # keep the channel open to keep reading guest output
+
+        def _enqueue(self, item):
+            """Queue an SSH-side event, applying backpressure if we're behind."""
+            self._inbound.put_nowait(item)
+            if (not self._reading_paused
+                    and self._chan is not None
+                    and self._inbound.qsize() >= INBOUND_HIGH_WATER):
+                try:
+                    self._chan.pause_reading()
+                    self._reading_paused = True
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def pause_writing(self):
+            # asyncssh's outbound buffer to the SSH client is full: stop pulling
+            # guest output until it drains (resume_writing), so a client that
+            # stops reading can't make us buffer guest output without bound.
+            self._write_resumed.clear()
+
+        def resume_writing(self):
+            self._write_resumed.set()
 
         def session_started(self):
             self._tasks.append(asyncio.ensure_future(self._run()))
@@ -201,12 +238,33 @@ if asyncssh is not None:
 
             self._tasks.append(asyncio.ensure_future(self._pump_inbound()))
             self._tasks.append(asyncio.ensure_future(self._keepalive()))
-            await self._pump_outbound()
+            try:
+                await self._pump_outbound()
+            finally:
+                # The guest session ended: stop the sibling pumps and close the
+                # vsock now, rather than leaking them (a keepalive PINGing a dead
+                # guest, an open vsock socket) until the SSH channel closes.
+                current = asyncio.current_task()
+                for t in self._tasks:
+                    if t is not current:
+                        t.cancel()
+                if self._writer is not None:
+                    try:
+                        self._writer.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         async def _pump_inbound(self):
             """SSH -> guest: stdin, window resize, EOF."""
             while True:
                 kind, val = await self._inbound.get()
+                if (self._reading_paused
+                        and self._inbound.qsize() <= INBOUND_LOW_WATER):
+                    try:
+                        self._chan.resume_reading()
+                        self._reading_paused = False
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     if kind == "data":
                         await write_frame(self._writer, FRAME_STDIN, val)
@@ -232,6 +290,11 @@ if asyncssh is not None:
             """guest -> SSH: stream stdout/stderr, propagate EXIT/ERROR."""
             try:
                 while True:
+                    # If the SSH client has stopped reading (asyncssh's write
+                    # buffer is full), wait rather than pulling more guest output
+                    # into an unbounded buffer.
+                    if not self._write_resumed.is_set():
+                        await self._write_resumed.wait()
                     frame = await read_frame(self._reader)
                     if frame is None:
                         break
@@ -247,11 +310,15 @@ if asyncssh is not None:
                         else:
                             self._chan.write_stderr(payload)
                     elif ftype == FRAME_EXIT:
-                        code = json.loads(payload or b"{}").get("code", 0)
+                        # _parse_json (not raw json.loads) so a malformed EXIT
+                        # from a buggy guest raises GuestCommandError -- caught
+                        # below -- instead of an unhandled ValueError/AttributeError
+                        # that would kill this task and leak the siblings.
+                        code = _parse_json(payload or b"{}").get("code", 0)
                         self._chan.exit(code if isinstance(code, int) else 0)
                         return
                     elif ftype == FRAME_ERROR:
-                        msg = json.loads(payload or b"{}").get("message", "")
+                        msg = _parse_json(payload or b"{}").get("message", "")
                         self._chan.write(f"\r\nssh_gateway: guest agent error: {msg}\r\n".encode())
                         self._chan.exit(1)
                         return
