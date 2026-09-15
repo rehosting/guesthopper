@@ -104,6 +104,16 @@ class TelnetInboundTests(unittest.TestCase):
         self.assertEqual(data, b"echo hi\n")
         self.assertEqual(replies, bytes([IAC, WONT, 99]))
 
+    def test_unterminated_subnegotiation_is_bounded(self):
+        # IAC SB then a flood of bytes with no IAC SE must not grow the
+        # subnegotiation buffer without bound (memory-DoS guard).
+        self.p.feed(bytes([IAC, SB, OPT_NAWS]))
+        self.p.feed(b"\x00" * (tg.MAX_SUBNEG_LEN * 4))
+        self.assertLessEqual(len(self.p._sb), tg.MAX_SUBNEG_LEN)
+        # A well-formed NAWS afterwards still resyncs once IAC SE arrives.
+        _, resizes, _ = self.p.feed(bytes([IAC, SE]))
+        self.assertEqual(resizes, [])  # the flooded subneg is dropped, not crashed
+
 
 if __name__ == "__main__":
     unittest.main()

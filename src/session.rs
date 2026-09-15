@@ -541,23 +541,43 @@ async fn open_pty<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    // SAFETY: valid out-pointers; null term/winsize means kernel defaults.
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
+    // openpty(3) opens /dev/ptmx and the slave -- a synchronous device open that
+    // can stall on a slow single emulated vCPU or a half-implemented emulated pty
+    // driver. Run it on a blocking thread so a stall there can't freeze every
+    // other session on this current_thread runtime (same discipline as
+    // warn_long_command's /dev/ttyS0 open).
+    let (master, slave) = match tokio::task::spawn_blocking(|| {
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        // SAFETY: valid out-pointers; null term/winsize means kernel defaults.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok((master, slave))
+        }
+    })
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            // e.g. no /dev/ptmx / CONFIG_UNIX98_PTYS in the guest kernel.
+            send_error(tx, &format!("openpty failed: {e}")).await;
+            return Ok(());
+        }
+        Err(e) => {
+            send_error(tx, &format!("openpty task failed: {e}")).await;
+            return Ok(());
+        }
     };
-    if rc < 0 {
-        // e.g. no /dev/ptmx / CONFIG_UNIX98_PTYS in the guest kernel.
-        send_error(tx, &format!("openpty failed: {}", std::io::Error::last_os_error())).await;
-        return Ok(());
-    }
     set_winsize(master, req.rows.unwrap_or(24), req.cols.unwrap_or(80));
 
     // Keep the pty master out of the child. openpty(3) does not set O_CLOEXEC,
