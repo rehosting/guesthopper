@@ -31,16 +31,20 @@ crossPkgs.rustPlatform.buildRustPackage {
     # static.crates.io CDN serves the identical bytes (same sha256, so the
     # Cargo.lock checksums still validate) with no User-Agent gate.
     #
-    # Cargo.lock records crates against the *sparse* registry
-    # (`sparse+https://index.crates.io/`, cargo's default since 1.70), which
-    # importCargoLock's `extraRegistries` hook remaps to the CDN. fetchCrate
-    # then builds https://static.crates.io/crates/<name>/<ver>/download. Using
-    # the sparse key (rather than the legacy git-index URL) also avoids cargo's
-    # "source registry `crates-io` already defined" error, since the git-index
-    # URL aliases cargo's built-in crates-io source. This is the exact recipe in
-    # nixpkgs' own import-cargo-lock `basic-sparse` test.
+    # Cargo.lock records crates against a synthetic `registry+https://static.
+    # crates.io/` source, which importCargoLock's `extraRegistries` hook maps to
+    # the CDN download base -- fetchCrate then builds
+    # https://static.crates.io/crates/<name>/<ver>/download. Two constraints make
+    # this the right shape, because penguin builds guesthopper (as a flake input,
+    # nixpkgs.follows) against a nixpkgs whose importCargoLock is OLDER than this
+    # repo's and understands ONLY the `registry+` prefix (no `sparse+`):
+    #   - `registry+` (not `sparse+`): both nixpkgs vintages accept it.
+    #   - a synthetic index host (not the real crates.io-index URL): remapping
+    #     the canonical crates-io via extraRegistries makes cargo's vendor config
+    #     define the crates-io source twice ("source registry `crates-io` already
+    #     defined"). A non-canonical URL is a distinct source, so no collision.
     extraRegistries = {
-      "sparse+https://index.crates.io/" = "https://static.crates.io/crates";
+      "https://static.crates.io/" = "https://static.crates.io/crates";
     };
   };
 
@@ -53,19 +57,10 @@ crossPkgs.rustPlatform.buildRustPackage {
   # flipped on; the hook's separate "linker" key still selects the cross linker.
   RUSTFLAGS = "-Ctarget-feature=+crt-static -Cforce-frame-pointers=yes";
 
-  # Drop the embedded-toolchains linker config (it hardcodes /opt/cross paths);
-  # nix supplies the cross linker instead. Replace it with a minimal config that
-  # pins the built-in crates-io registry to the git protocol. Our Cargo.lock
-  # records crates against the sparse registry, and importCargoLock's vendor
-  # config replaces `sparse+https://index.crates.io/` with the vendored sources.
-  # Without this pin cargo treats that sparse URL AND its built-in crates-io as
-  # the same registry -- "source registry `crates-io` already defined" -- so we
-  # force crates-io to git, leaving the sparse source distinct. This mirrors the
-  # nixpkgs import-cargo-lock `basic-sparse` test.
+  # Drop the embedded-toolchains linker config; it hardcodes /opt/cross paths,
+  # and nix supplies the cross linker via CARGO_TARGET_<triple>_LINKER instead.
   postPatch = ''
     rm -f .cargo/config .cargo/config.toml
-    mkdir -p .cargo
-    printf '[registries.crates-io]\nprotocol = "git"\n' > .cargo/config.toml
   '';
 
   # Guest binary -- no host-runnable tests during a cross build.
