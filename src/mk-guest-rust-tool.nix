@@ -22,29 +22,23 @@
 crossPkgs.rustPlatform.buildRustPackage {
   inherit pname version src;
 
+  # crates.io returns HTTP 403 to nixpkgs' crate fetcher: it sends a generic
+  # `curl/*` User-Agent to the crates.io API download endpoint
+  # (https://crates.io/api/v1/crates/<name>/<ver>/download), which crates.io's
+  # crawler policy now refuses. The static.crates.io CDN serves the identical
+  # bytes (same sha256, so the lockfile checksums still validate) with no UA gate.
+  #
+  # Point the crate DOWNLOAD at the CDN via importCargoLock's `extraRegistries`,
+  # while leaving Cargo.lock CANONICAL (crates stay on the real crates.io-index).
+  # Keeping the lock canonical is essential: a rewritten lock source makes
+  # `cargo build --frozen` (cargoBuildHook) reject the lock, and this repo is
+  # also built against penguin's OLDER nixpkgs via `nixpkgs.follows`, whose
+  # importCargoLock/buildRustPackage APIs differ from this repo's newer pin --
+  # `cargoLock` + `extraRegistries` is the one crate-source path both accept.
   cargoLock = {
     lockFile = "${src}/Cargo.lock";
-
-    # crates.io now returns HTTP 403 to the generic `curl/*` User-Agent that
-    # nixpkgs' crate fetcher sends to its legacy download endpoint on the API
-    # host (https://crates.io/api/v1/crates/<name>/<ver>/download). The
-    # static.crates.io CDN serves the identical bytes (same sha256, so the
-    # Cargo.lock checksums still validate) with no User-Agent gate.
-    #
-    # Cargo.lock records crates against a synthetic `registry+https://static.
-    # crates.io/` source, which importCargoLock's `extraRegistries` hook maps to
-    # the CDN download base -- fetchCrate then builds
-    # https://static.crates.io/crates/<name>/<ver>/download. Two constraints make
-    # this the right shape, because penguin builds guesthopper (as a flake input,
-    # nixpkgs.follows) against a nixpkgs whose importCargoLock is OLDER than this
-    # repo's and understands ONLY the `registry+` prefix (no `sparse+`):
-    #   - `registry+` (not `sparse+`): both nixpkgs vintages accept it.
-    #   - a synthetic index host (not the real crates.io-index URL): remapping
-    #     the canonical crates-io via extraRegistries makes cargo's vendor config
-    #     define the crates-io source twice ("source registry `crates-io` already
-    #     defined"). A non-canonical URL is a distinct source, so no collision.
     extraRegistries = {
-      "https://static.crates.io/" = "https://static.crates.io/crates";
+      "https://github.com/rust-lang/crates.io-index" = "https://static.crates.io/crates";
     };
   };
 
@@ -61,6 +55,25 @@ crossPkgs.rustPlatform.buildRustPackage {
   # and nix supplies the cross linker via CARGO_TARGET_<triple>_LINKER instead.
   postPatch = ''
     rm -f .cargo/config .cargo/config.toml
+  '';
+
+  # The `extraRegistries` remap (needed only to send the nix-side crate DOWNLOAD
+  # to the CDN) makes importCargoLock's generated vendor config declare a
+  # [source."https://github.com/rust-lang/crates.io-index"] block *alongside*
+  # cargo's built-in [source.crates-io]; cargo then aborts on the duplicate
+  # crates-io definition ("source registry `crates-io` already defined"). The
+  # built-in [source.crates-io] replace-with = vendored-sources already vendors
+  # every crate (the lock is canonical), so the extra block is pure redundancy --
+  # strip it. cargoSetupHook writes the merged config to a `.cargo/config`
+  # (older nixpkgs) or `.cargo/config.toml` (newer), and on the older nixpkgs it
+  # runs before stdenv cd's into sourceRoot, so the file lands in the BUILD ROOT
+  # one level up -- cargo reads it by walking up. Strip both the sourceRoot copy
+  # and the parent, both filenames. Runs in preConfigure, after that hook.
+  preConfigure = ''
+    for cfg in .cargo/config .cargo/config.toml ../.cargo/config ../.cargo/config.toml; do
+      [ -f "$cfg" ] || continue
+      sed -i '\#^\[source\."https://github\.com/rust-lang/crates\.io-index"\]$#,\#^replace-with#d' "$cfg"
+    done
   '';
 
   # Guest binary -- no host-runnable tests during a cross build.
