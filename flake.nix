@@ -66,6 +66,7 @@
       #   guesthopper/guest_cmd.py                         host-side client (arch-independent)
       #   guesthopper/telnet_gateway.py                    host-side telnet front door (arch-independent)
       #   guesthopper/ssh_gateway.py                       host-side SSH front door (arch-independent)
+      #   guesthopper/guest_fs.py                          host-side file-service client used by ssh_gateway.py
       dist = pkgs.runCommand "guesthopper-dist"
         {
           nativeBuildInputs = with pkgs.buildPackages; [ coreutils ];
@@ -101,6 +102,9 @@
           # penguin's python env). Penguin runs it at
           # /igloo_static/guesthopper/ssh_gateway.py.
           cp ${self}/ssh_gateway.py "$out/guesthopper/ssh_gateway.py"
+          # Async client for the guest agent's `fs` verb; ssh_gateway.py imports it
+          # to serve scp/sftp, so it must sit beside it.
+          cp ${self}/guest_fs.py "$out/guesthopper/guest_fs.py"
 
           chmod -R u+w "$out"
         '';
