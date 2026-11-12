@@ -11,6 +11,12 @@ The guest never runs sshd and holds no key material: SSH is terminated entirely
 here, on the host side, and only the clean vsock frame protocol crosses into the
 guest. The wire contract (frame types, handshake) is shared with guest_cmd.py.
 
+File transfer works the same way: ``scp`` and ``sftp`` against this door are
+served here by asyncssh's SFTP server, backed by the guest agent's ``fs`` verb
+(guest_fs.py) rather than the local filesystem. The guest runs no sftp-server
+and needs no ``scp`` binary; both modern scp (SFTP subsystem) and legacy
+``scp -O`` (an ``scp -t/-f`` exec, which asyncssh also speaks) are handled.
+
 Auth is OPEN (any username, no password/key), mirroring the telnet door and the
 serial/telnet console it replaces: access is gated by being able to reach the
 listener. penguin_run binds it on the container's network (0.0.0.0) but publishes
@@ -26,7 +32,9 @@ asyncssh; the SSH server itself needs it at run time.
 
 import argparse
 import asyncio
+import functools
 import json
+import stat
 import sys
 
 from guest_cmd import (
@@ -45,6 +53,7 @@ from guest_cmd import (
     _parse_json,
     find_vsocket,
 )
+from guest_fs import FS_READ_LIMIT, GuestFs, GuestFsError
 
 # SSH->guest inbound backpressure: when the queue of not-yet-forwarded client
 # events reaches the high-water mark (the guest/vsock side has stalled and isn't
@@ -54,8 +63,13 @@ from guest_cmd import (
 INBOUND_HIGH_WATER = 1024
 INBOUND_LOW_WATER = 256
 
+# SFTP protocol version offered to clients. v3 is what OpenSSH speaks (and all
+# scp needs); the GuestSFTPServer below implements the v3 operation set.
+SFTP_VERSION = 3
+
 try:
     import asyncssh
+    from asyncssh.stream import SSHServerStreamSession
 except ImportError:  # pragma: no cover - exercised only where asyncssh is absent
     asyncssh = None
 
@@ -108,6 +122,12 @@ def resize_payload(rows, cols):
     return json.dumps({"rows": rows, "cols": cols}).encode("utf-8")
 
 
+def is_scp_command(command):
+    """True if an SSH exec request is the remote half of a legacy ``scp -O``
+    (``scp -t <dst>`` / ``scp -f <src>``), which the gateway serves itself."""
+    return isinstance(command, str) and command.startswith("scp ")
+
+
 # --- SSH glue (needs asyncssh; validation-pending -- no asyncssh/guest here) --
 #
 # Defined only when asyncssh is importable so this module loads for unit tests
@@ -143,10 +163,30 @@ if asyncssh is not None:
             # buffering without bound when the client stops reading.
             self._write_resumed = asyncio.Event()
             self._write_resumed.set()
+            # Set once the client asks for file transfer (the sftp subsystem or
+            # a legacy scp exec): asyncssh's own stream session then runs its
+            # SFTP/scp server on this channel and every callback below is handed
+            # to it instead of the pty/exec bridge.
+            self._xfer = None
+
+        def _start_file_transfer(self):
+            self._xfer = SSHServerStreamSession(
+                None,
+                lambda chan: GuestSFTPServer(chan, self._uds_path, self._vsock_port),
+                sftp_version=SFTP_VERSION,
+                allow_scp=True,
+            )
+            self._xfer.connection_made(self._chan)
 
         # -- asyncssh callbacks --
         def connection_made(self, chan):
             self._chan = chan
+
+        def subsystem_requested(self, subsystem):
+            if subsystem != "sftp":
+                return False
+            self._start_file_transfer()
+            return True
 
         def pty_requested(self, term_type, term_size, term_modes):
             self._want_pty = True
@@ -164,16 +204,28 @@ if asyncssh is not None:
             # json.dumps.
             if isinstance(command, (bytes, bytearray)):
                 command = bytes(command).decode("utf-8", "replace")
+            if is_scp_command(command) and not self._want_pty:
+                # Legacy `scp -O`: serve the scp protocol here rather than
+                # running `scp` in the guest (which rarely has one).
+                self._start_file_transfer()
+                return True
             self._command = command
             return True
 
         def terminal_size_changed(self, width, height, pixwidth, pixheight):
+            if self._xfer is not None:
+                return
             self._enqueue(("resize", (height, width)))
 
         def data_received(self, data, datatype):
+            if self._xfer is not None:
+                self._xfer.data_received(data, datatype)
+                return
             self._enqueue(("data", data))
 
         def eof_received(self):
+            if self._xfer is not None:
+                return self._xfer.eof_received()
             self._enqueue(("eof", None))
             return True  # keep the channel open to keep reading guest output
 
@@ -190,18 +242,30 @@ if asyncssh is not None:
                     pass
 
         def pause_writing(self):
+            if self._xfer is not None:
+                self._xfer.pause_writing()
+                return
             # asyncssh's outbound buffer to the SSH client is full: stop pulling
             # guest output until it drains (resume_writing), so a client that
             # stops reading can't make us buffer guest output without bound.
             self._write_resumed.clear()
 
         def resume_writing(self):
+            if self._xfer is not None:
+                self._xfer.resume_writing()
+                return
             self._write_resumed.set()
 
         def session_started(self):
+            if self._xfer is not None:
+                self._xfer.session_started()
+                return
             self._tasks.append(asyncio.ensure_future(self._run()))
 
         def connection_lost(self, exc):
+            if self._xfer is not None:
+                self._xfer.connection_lost(exc)
+                return
             for t in self._tasks:
                 t.cancel()
             # Closing the vsock writer makes the guest see read-EOF and hang up
@@ -330,6 +394,243 @@ if asyncssh is not None:
                     pass
             self._chan.exit(0)
 
+    def _guest_op(fn):
+        """Turn a guest file-operation failure into the SFTP status the client
+        should see. Without this asyncssh would report every one as a bare
+        connection-level failure."""
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except GuestCommandError as e:
+                raise _sftp_error(e) from None
+
+        return wrapper
+
+    def _sftp_error(exc):
+        kind = exc.kind if isinstance(exc, GuestFsError) else "fail"
+        cls = {
+            "noent": asyncssh.SFTPNoSuchFile,
+            "perm": asyncssh.SFTPPermissionDenied,
+            "unsupported": asyncssh.SFTPOpUnsupported,
+        }.get(kind, asyncssh.SFTPFailure)
+        return cls(str(exc))
+
+    def _filetype(mode):
+        for test, ftype in (
+            (stat.S_ISREG, asyncssh.FILEXFER_TYPE_REGULAR),
+            (stat.S_ISDIR, asyncssh.FILEXFER_TYPE_DIRECTORY),
+            (stat.S_ISLNK, asyncssh.FILEXFER_TYPE_SYMLINK),
+            (stat.S_ISSOCK, asyncssh.FILEXFER_TYPE_SOCKET),
+            (stat.S_ISCHR, asyncssh.FILEXFER_TYPE_CHAR_DEVICE),
+            (stat.S_ISBLK, asyncssh.FILEXFER_TYPE_BLOCK_DEVICE),
+            (stat.S_ISFIFO, asyncssh.FILEXFER_TYPE_FIFO),
+        ):
+            if test(mode):
+                return ftype
+        return asyncssh.FILEXFER_TYPE_UNKNOWN
+
+    def _to_sftp_attrs(attrs):
+        """Guest stat dict (files.rs `attrs`) -> asyncssh SFTPAttrs."""
+        if not attrs:
+            return asyncssh.SFTPAttrs()
+        mode = attrs.get("mode", 0)
+        return asyncssh.SFTPAttrs(
+            type=_filetype(mode),
+            size=attrs.get("size"),
+            uid=attrs.get("uid"),
+            gid=attrs.get("gid"),
+            permissions=mode,
+            atime=attrs.get("atime"),
+            mtime=attrs.get("mtime"),
+            nlink=attrs.get("nlink"),
+        )
+
+    def _setstat_fields(attrs):
+        """The subset of an SFTPAttrs the guest can apply (absent ones None)."""
+        return dict(size=attrs.size, uid=attrs.uid, gid=attrs.gid,
+                    mode=attrs.permissions, atime=attrs.atime, mtime=attrs.mtime)
+
+    class _GuestFile:
+        """An open guest file: the agent's handle plus the path it came from."""
+
+        def __init__(self, handle, path):
+            self.handle = handle
+            self.path = path
+
+    class GuestSFTPServer(asyncssh.SFTPServer):
+        """asyncssh SFTP server whose filesystem is the *guest's*, reached over
+        one vsock ``fs`` session (opened on first use, closed in exit())."""
+
+        def __init__(self, chan, uds_path, vsock_port):
+            super().__init__(chan)
+            self._uds_path = uds_path
+            self._vsock_port = vsock_port
+            self._fs = None
+            self._fs_lock = asyncio.Lock()
+
+        async def _guest(self):
+            async with self._fs_lock:
+                if self._fs is None:
+                    self._fs = await GuestFs.connect(self._uds_path, self._vsock_port)
+                return self._fs
+
+        # `ls -l` owner/group columns: the ids are the guest's, so resolving
+        # them against this (host/container) passwd database would be wrong.
+        def format_user(self, uid):
+            return "" if uid is None else str(uid)
+
+        def format_group(self, gid):
+            return "" if gid is None else str(gid)
+
+        @_guest_op
+        async def open(self, path, pflags, attrs):
+            fs = await self._guest()
+            handle = await fs.open(
+                path,
+                read=bool(pflags & asyncssh.FXF_READ),
+                write=bool(pflags & asyncssh.FXF_WRITE),
+                append=bool(pflags & asyncssh.FXF_APPEND),
+                create=bool(pflags & asyncssh.FXF_CREAT),
+                trunc=bool(pflags & asyncssh.FXF_TRUNC),
+                excl=bool(pflags & asyncssh.FXF_EXCL),
+                mode=attrs.permissions,
+            )
+            return _GuestFile(handle, path)
+
+        async def close(self, file_obj):
+            try:
+                await (await self._guest()).close_handle(file_obj.handle)
+            except GuestFsError as e:
+                raise _sftp_error(e) from None
+            except GuestCommandError:
+                # The guest session is already gone, and its handles with it:
+                # nothing left to close. Must not raise -- asyncssh closes any
+                # open files during teardown, before it calls exit(), and an
+                # error here would skip that and the channel close.
+                pass
+
+        @_guest_op
+        async def read(self, file_obj, offset, size):
+            # The client picks `size` (any u32) and asyncssh passes it through
+            # unchecked; the data is buffered whole, so cap it. SFTP readers
+            # treat a short read as "ask again", and well-behaved ones never
+            # exceed the limit we advertise anyway.
+            size = min(size, FS_READ_LIMIT)
+            return await (await self._guest()).read(file_obj.handle, offset, size)
+
+        @_guest_op
+        async def write(self, file_obj, offset, data):
+            await (await self._guest()).write(file_obj.handle, offset, data)
+            return len(data)
+
+        @_guest_op
+        async def stat(self, path):
+            return _to_sftp_attrs(await (await self._guest()).stat(path))
+
+        @_guest_op
+        async def lstat(self, path):
+            return _to_sftp_attrs(await (await self._guest()).stat(path, follow=False))
+
+        @_guest_op
+        async def fstat(self, file_obj):
+            return _to_sftp_attrs(await (await self._guest()).fstat(file_obj.handle))
+
+        @_guest_op
+        async def setstat(self, path, attrs):
+            await (await self._guest()).setstat(path, **_setstat_fields(attrs))
+
+        @_guest_op
+        async def lsetstat(self, path, attrs):
+            await (await self._guest()).setstat(path, follow=False, **_setstat_fields(attrs))
+
+        @_guest_op
+        async def fsetstat(self, file_obj, attrs):
+            await (await self._guest()).setstat(handle=file_obj.handle, **_setstat_fields(attrs))
+
+        async def scandir(self, path):
+            try:
+                fs = await self._guest()
+                for name in (b".", b".."):
+                    attrs = await fs.stat(path + b"/" + name, follow=False)
+                    yield asyncssh.SFTPName(name, attrs=_to_sftp_attrs(attrs))
+                async for name, attrs in fs.scandir(path):
+                    # A directory entry is a single component. Anything else
+                    # could only come from a misbehaving guest agent, and a
+                    # client that trusted it (`../x`) would write outside the
+                    # directory it is downloading into.
+                    if not name or b"/" in name or name in (b".", b".."):
+                        continue
+                    yield asyncssh.SFTPName(name, attrs=_to_sftp_attrs(attrs))
+            except GuestCommandError as e:
+                raise _sftp_error(e) from None
+
+        @_guest_op
+        async def remove(self, path):
+            await (await self._guest()).remove(path)
+
+        @_guest_op
+        async def mkdir(self, path, attrs):
+            await (await self._guest()).mkdir(path, mode=attrs.permissions)
+
+        @_guest_op
+        async def rmdir(self, path):
+            await (await self._guest()).rmdir(path)
+
+        @_guest_op
+        async def realpath(self, path):
+            return await (await self._guest()).realpath(path or b".")
+
+        @_guest_op
+        async def rename(self, oldpath, newpath):
+            await (await self._guest()).rename(oldpath, newpath)
+
+        @_guest_op
+        async def posix_rename(self, oldpath, newpath):
+            await (await self._guest()).rename(oldpath, newpath, replace=True)
+
+        @_guest_op
+        async def readlink(self, path):
+            return await (await self._guest()).readlink(path)
+
+        @_guest_op
+        async def symlink(self, oldpath, newpath):
+            await (await self._guest()).symlink(oldpath, newpath)
+
+        @_guest_op
+        async def link(self, oldpath, newpath):
+            await (await self._guest()).link(oldpath, newpath)
+
+        @_guest_op
+        async def statvfs(self, path):
+            v = await (await self._guest()).statvfs(path)
+            return asyncssh.SFTPVFSAttrs(
+                v["bsize"], v["frsize"], v["blocks"], v["bfree"], v["bavail"],
+                v["files"], v["ffree"], v["favail"], 0, v["flag"], v["namemax"])
+
+        async def fstatvfs(self, file_obj):
+            return await self.statvfs(file_obj.path)
+
+        @_guest_op
+        async def fsync(self, file_obj):
+            await (await self._guest()).fsync(file_obj.handle)
+
+        async def exit(self):
+            # End of the SFTP/scp session: drop the vsock fs session so the
+            # guest closes its handles and frees the session slot.
+            async with self._fs_lock:
+                fs, self._fs = self._fs, None
+            if fs is not None:
+                await fs.close()
+            # asyncssh's SFTP server just closes the channel when the client is
+            # done, with no exit status -- which OpenSSH's scp (it runs `ssh -s
+            # sftp` underneath and checks how it exited) reports as a failed
+            # copy even though every byte arrived. Report a clean exit, as
+            # sshd does for sftp-server. (The legacy scp path sets its own.)
+            if self.channel.get_subsystem() == "sftp":
+                self.channel.exit(0)
+
     class _GatewayServer(asyncssh.SSHServer):
         def __init__(self, uds_path, vsock_port):
             self._uds_path = uds_path
@@ -370,7 +671,8 @@ if asyncssh is not None:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Bridge an SSH client to a guest vsock pty session."
+        description="Bridge an SSH client (shell, exec, scp, sftp) to the guest "
+        "command channel."
     )
     parser.add_argument("--listen-host", default="127.0.0.1",
                         help="Address to serve SSH on (default 127.0.0.1).")

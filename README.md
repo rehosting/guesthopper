@@ -2,6 +2,32 @@
 
 The project contains a [client program](guest_cmd.py) that interacts with a [server](src/main.rs) listening in the guest to execute commands locally and propagate stdout/stderr/exit status to the host.
 
+## File transfer (scp / sftp)
+
+The SSH front door ([ssh_gateway.py](ssh_gateway.py)) also serves `scp` and `sftp`, so files can be copied in and out of a live guest:
+
+```sh
+scp firmware.bin root@<container-ip>:/tmp/      # into the guest
+scp -r root@<container-ip>:/etc ./guest-etc     # out of the guest
+sftp root@<container-ip>
+```
+
+As with the shell, SSH is terminated on the host: the gateway runs the SFTP protocol itself and performs each file operation through the agent's `fs` verb ([src/files.rs](src/files.rs), client in [guest_fs.py](guest_fs.py)). The guest needs no `sshd`, `sftp-server`, `scp` binary or other userland tools. Both modern scp (SFTP subsystem) and legacy `scp -O` work. Relative remote paths resolve against the agent's working directory.
+
+Things to know:
+
+* Access is as open as the shell: anyone who can reach the SSH port can read and write guest files as root.
+* An `ssh host "scp ..."` exec is always answered by the gateway's own scp implementation, even if the firmware ships an `scp`. Only the transfer forms (`scp -t` / `scp -f`, i.e. what `scp -O` sends) are understood; to run the guest's own binary for anything else, go through a shell (`ssh host "sh -c 'scp ...'"`).
+* Only regular files and seekable devices transfer. FIFOs, ttys and sockets can be listed and stat'ed but not read or written.
+* A single read is capped at 4 MiB (the limit advertised to SFTP clients); clients simply ask again for the rest.
+
+To exercise the whole path without a guest, build the Unix-socket stand-in for the agent and run the end-to-end test (needs `asyncssh` and OpenSSH's `scp`/`sftp`):
+
+```sh
+cargo build --example uds_agent
+python3 -m unittest tests.test_scp_e2e
+```
+
 # Distribution
 
 DISTRIBUTION STATEMENT A. Approved for public release. Distribution is unlimited.

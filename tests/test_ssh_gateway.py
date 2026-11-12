@@ -93,5 +93,75 @@ class ReadFrameTests(unittest.TestCase):
         self.assertEqual(f2, (guest_cmd.FRAME_EXIT, b'{"code":0}'))
 
 
+class _FakeFs:
+    """Stands in for guest_fs.GuestFs behind a GuestSFTPServer."""
+
+    def __init__(self):
+        self.read_sizes = []
+        self.dead = False
+        self.names = []
+
+    async def read(self, handle, offset, size):
+        self.read_sizes.append(size)
+        return b"x" * min(size, 10)
+
+    async def close_handle(self, handle):
+        if self.dead:
+            raise guest_cmd.GuestCommandError("guest closed the fs session")
+        raise sg.GuestFsError("invalid", "not an open handle")
+
+    async def stat(self, path, follow=True):
+        return {"mode": 0o040755, "size": 0}
+
+    async def scandir(self, path):
+        for name in self.names:
+            yield name, {"mode": 0o100644, "size": 1}
+
+
+@unittest.skipUnless(sg.asyncssh is not None, "asyncssh not installed")
+class GuestSFTPServerTests(unittest.TestCase):
+    """The SFTP bridge's own logic, with the guest faked out."""
+
+    def _server(self, fs):
+        server = sg.GuestSFTPServer(object(), "/nonexistent", 1)
+        server._fs = fs
+        return server
+
+    def test_read_size_from_the_client_is_clamped(self):
+        # An SFTP client may ask for any u32 length; passing it through would
+        # make the gateway buffer that much guest data per request.
+        fs = _FakeFs()
+
+        async def drive():
+            server = self._server(fs)
+            await server.read(sg._GuestFile(1, b"/f"), 0, 0xFFFFFFFF)
+            await server.read(sg._GuestFile(1, b"/f"), 0, 100)
+
+        asyncio.run(drive())
+        self.assertEqual(fs.read_sizes, [sg.FS_READ_LIMIT, 100])
+        # Never above what asyncssh advertises to clients as the server limit.
+        self.assertLessEqual(sg.FS_READ_LIMIT, sg.asyncssh.sftp.MAX_SFTP_READ_LEN)
+
+    def test_close_after_the_guest_session_died_does_not_raise(self):
+        # asyncssh closes open files during teardown before calling exit(); an
+        # exception there would skip exit() and the channel close.
+        fs = _FakeFs()
+        fs.dead = True
+        asyncio.run(self._server(fs).close(sg._GuestFile(1, b"/f")))
+
+    def test_close_refused_by_a_live_guest_is_still_an_sftp_error(self):
+        with self.assertRaises(sg.asyncssh.SFTPError):
+            asyncio.run(self._server(_FakeFs()).close(sg._GuestFile(1, b"/f")))
+
+    def test_directory_listing_drops_names_that_are_not_single_components(self):
+        fs = _FakeFs()
+        fs.names = [b"ok", b"../escape", b"a/b", b"", b"..", b".", b"also-ok"]
+
+        async def drive():
+            return [n.filename async for n in self._server(fs).scandir(b"/d")]
+
+        self.assertEqual(asyncio.run(drive()), [b".", b"..", b"ok", b"also-ok"])
+
+
 if __name__ == "__main__":
     unittest.main()
