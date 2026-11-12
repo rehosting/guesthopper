@@ -4,5 +4,6 @@
 //! be driven by integration tests over an in-memory duplex (no vsock needed).
 //! The binary (`main.rs`) wires these onto the real vsock transport.
 
+pub mod files;
 pub mod frame;
 pub mod session;
