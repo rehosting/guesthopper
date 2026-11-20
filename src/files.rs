@@ -919,18 +919,47 @@ mod tests {
 
     // The `test-block` op parks its blocking thread here until a test opens
     // the gate -- a stand-in for a syscall wedged in the guest kernel.
-    static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+    struct Gate {
+        open: bool,
+        /// Jobs that have ever reached the gate (so a test can wait for one to
+        /// arrive instead of sleeping and hoping).
+        arrivals: usize,
+    }
+
+    static GATE: (Mutex<Gate>, Condvar) =
+        (Mutex::new(Gate { open: false, arrivals: 0 }), Condvar::new());
 
     pub(super) fn gate_wait() {
-        let mut open = GATE.0.lock().unwrap();
-        while !*open {
-            open = GATE.1.wait(open).unwrap();
+        let mut gate = GATE.0.lock().unwrap();
+        gate.arrivals += 1;
+        while !gate.open {
+            gate = GATE.1.wait(gate).unwrap();
         }
     }
 
     fn gate_set(open: bool) {
-        *GATE.0.lock().unwrap() = open;
+        GATE.0.lock().unwrap().open = open;
         GATE.1.notify_all();
+    }
+
+    fn gate_arrivals() -> usize {
+        GATE.0.lock().unwrap().arrivals
+    }
+
+    /// Generous bound for "this should happen promptly". Tests wait on the
+    /// event itself, so a slow or busy machine only makes them slower; this is
+    /// just the point at which waiting longer is hopeless. It must stay well
+    /// under LONG and the two-minute op timeout, which are what a passing test
+    /// rules out.
+    const SOON: Duration = Duration::from_secs(15);
+
+    /// Poll until `cond` holds, failing with `what` after SOON.
+    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + SOON;
+        while !cond() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Opens the gate when dropped, so a failing assertion can't leave a
@@ -951,7 +980,8 @@ mod tests {
         serde_json::from_slice(split_payload(payload).unwrap().0).unwrap()
     }
 
-    const LONG: Duration = Duration::from_secs(30);
+    /// An idle/admission timeout that must not fire during a test.
+    const LONG: Duration = Duration::from_secs(120);
 
     /// Take the serial lock and wait for jobs left behind by earlier tests to
     /// finish. A test that abandons a wedged job opens the gate as it ends,
@@ -976,7 +1006,7 @@ mod tests {
         let _serial = serial().await;
         let before = FS_JOBS.available_permits();
         let (release, gate) = std_mpsc::channel::<()>();
-        let permit = admit_job(Duration::from_secs(5)).await.expect("permit");
+        let permit = admit_job(SOON).await.expect("permit");
         let job = spawn_job(permit, move || {
             let _ = gate.recv(); // a wedged syscall
         });
@@ -987,13 +1017,10 @@ mod tests {
         assert_eq!(FS_JOBS.available_permits(), before - 1);
 
         release.send(()).unwrap();
-        for _ in 0..100 {
-            if FS_JOBS.available_permits() == before {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("permit was not released when the job finished");
+        eventually("the permit to be released when the job finished", || {
+            FS_JOBS.available_permits() == before
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1062,6 +1089,7 @@ mod tests {
         OpenGateOnDrop,
     ) {
         gate_set(false);
+        let arrivals = gate_arrivals();
         let (tx, rx) = tokio::sync::mpsc::channel::<(u8, Vec<u8>)>(64);
         let (host, guest) = tokio::io::duplex(transport_buf);
         let (mut g_rd, g_wr) = tokio::io::split(guest);
@@ -1074,8 +1102,7 @@ mod tests {
         });
         let block = request(json!({ "op": "test-block" }), &[]);
         frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &block).await.unwrap();
-        // Let the job reach the gate.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        eventually("the op to reach the gate", || gate_arrivals() > arrivals).await;
         (h_wr, h_rd, rx, cancel, session, OpenGateOnDrop)
     }
 
@@ -1088,12 +1115,12 @@ mod tests {
         assert!(!session.is_finished());
         drop(h_wr);
         drop(h_rd);
-        timeout(Duration::from_secs(3), session)
+        timeout(SOON, session)
             .await
             .expect("session outlived its client while an op was wedged")
             .unwrap();
         // The writer and anything else watching must be told too.
-        timeout(Duration::from_secs(1), cancel.wait()).await.expect("cancel not fired");
+        timeout(SOON, cancel.wait()).await.expect("cancel not fired");
     }
 
     #[tokio::test]
@@ -1103,7 +1130,7 @@ mod tests {
         let _serial = serial().await;
         let (_h_wr, _h_rd, _rx, _cancel, session, _gate) =
             wedged_session(Duration::from_millis(300)).await;
-        timeout(Duration::from_secs(3), session)
+        timeout(SOON, session)
             .await
             .expect("idle timeout was not enforced while an op was wedged")
             .unwrap();
@@ -1112,15 +1139,19 @@ mod tests {
     #[tokio::test]
     async fn pings_keep_a_session_alive_through_a_long_op_and_order_is_kept() {
         let _serial = serial().await;
-        let (mut h_wr, _h_rd, mut rx, _cancel, session, _gate) =
-            wedged_session(Duration::from_millis(400)).await;
+        // What matters is the ratio: PINGs arrive 20x more often than the idle
+        // timeout, so only a ~2 s stall of this whole process could make a
+        // healthy session look idle.
+        let idle = Duration::from_secs(2);
+        let (mut h_wr, _h_rd, mut rx, _cancel, session, _gate) = wedged_session(idle).await;
         // Requests pipelined behind the wedged one, plus PINGs for well over
         // the idle timeout.
         for path in ["2f", "2f746d70"] {
             let req = request(json!({ "op": "realpath", "path": path }), &[]);
             frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &req).await.unwrap();
         }
-        for _ in 0..10 {
+        let until = tokio::time::Instant::now() + idle * 2;
+        while tokio::time::Instant::now() < until {
             tokio::time::sleep(Duration::from_millis(100)).await;
             frame::write_frame(&mut h_wr, frame::FRAME_PING, &[]).await.unwrap();
         }
@@ -1130,7 +1161,7 @@ mod tests {
         gate_set(true);
         let mut got = Vec::new();
         for _ in 0..3 {
-            let (ftype, payload) = timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+            let (ftype, payload) = timeout(SOON, rx.recv()).await.unwrap().unwrap();
             assert_eq!(ftype, frame::FRAME_FS_RESP);
             got.push(response(&payload));
         }
@@ -1162,7 +1193,7 @@ mod tests {
         gate_set(true);
         let mut answers = 0;
         while answers < N + 1 {
-            let (_, payload) = timeout(Duration::from_secs(10), rx.recv())
+            let (_, payload) = timeout(SOON, rx.recv())
                 .await
                 .expect("a queued request was never answered")
                 .unwrap();
@@ -1216,13 +1247,27 @@ mod tests {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        let n = sent.load(std::sync::atomic::Ordering::Relaxed);
+        // The flood runs until intake stops reading and the transport fills.
+        // Wait for that plateau itself -- the count holding still, at or past
+        // the queue cap -- rather than for a fixed window to elapse.
+        let queue_cap = FS_PENDING_MAX / FS_PENDING_OVERHEAD;
+        let count = || sent.load(std::sync::atomic::Ordering::Relaxed);
+        eventually("the flood to fill the pending queue", || count() >= queue_cap).await;
+        let mut n = count();
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = count();
+            if now == n {
+                break;
+            }
+            n = now;
+            // Bounded: the assertion below is the real limit.
+            assert!(n <= 150_000, "flood is not being stopped: {n} accepted so far");
+        }
         flood.abort();
         // Queue cap, plus what fits in the 16 KiB transport (5 bytes a frame),
         // plus the one the reader holds while it waits for budget.
-        let cap = FS_PENDING_MAX / FS_PENDING_OVERHEAD + 16 * 1024 / 5 + 2;
-        assert!(n >= FS_PENDING_MAX / FS_PENDING_OVERHEAD / 2, "flood barely ran: {n}");
+        let cap = queue_cap + 16 * 1024 / 5 + 2;
         assert!(n <= cap, "{n} empty requests accepted; expected at most {cap}");
     }
 

@@ -17,6 +17,19 @@ import guest_cmd  # noqa: E402
 import guest_fs  # noqa: E402
 
 
+# How long to wait for something that should happen promptly. Waits poll for
+# the event itself, so a slow or busy machine only makes a test slower.
+SOON = 30
+
+
+async def eventually(what, cond):
+    deadline = asyncio.get_running_loop().time() + SOON
+    while not cond():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.01)
+
+
 class PayloadCodecTests(unittest.TestCase):
     def test_roundtrip_keeps_binary_data_separate_from_header(self):
         data = bytes(range(256)) * 3
@@ -159,7 +172,7 @@ class GuestFsTests(unittest.TestCase):
                 server.close()
                 await server.wait_closed()
 
-        return asyncio.run(asyncio.wait_for(drive(), 20))
+        return asyncio.run(asyncio.wait_for(drive(), 4 * SOON))
 
     def test_connect_requests_the_fs_verb(self):
         async def body(fs, guest):
@@ -193,8 +206,11 @@ class GuestFsTests(unittest.TestCase):
             before = len(guest.requests)
             guest.hold = asyncio.Event()
             calls = [asyncio.ensure_future(fs.call("read", h=h, off=i, len=1)) for i in range(10)]
-            # Every request reaches the guest's socket before any is answered.
-            await asyncio.sleep(0.2)
+            # The guest reads requests one at a time and is holding the first,
+            # so the rest can only have got as far as its socket: all ten are
+            # in flight together, none answered.
+            await eventually("the first request to reach the guest",
+                             lambda: len(guest.requests) > before)
             self.assertFalse(any(c.done() for c in calls))
             guest.hold.set()
             results = await asyncio.gather(*calls)
@@ -256,12 +272,12 @@ class GuestFsTests(unittest.TestCase):
         async def body(fs, guest):
             guest.hold = asyncio.Event()  # never answered
             pending = asyncio.ensure_future(fs.call("read", h=1, off=0, len=1))
-            await asyncio.sleep(0.1)
+            await eventually("the request to reach the guest", lambda: guest.requests)
             await fs.close()
             with self.assertRaises(guest_cmd.GuestCommandError):
                 await pending
             guest.hold.set()
-            await asyncio.wait_for(guest.closed.wait(), 5)
+            await asyncio.wait_for(guest.closed.wait(), SOON)
 
         self.run_with_guest(body)
 
@@ -270,10 +286,9 @@ class GuestFsTests(unittest.TestCase):
         guest_fs.PING_INTERVAL_S = 0.05
         try:
             async def body(fs, guest):
-                await asyncio.sleep(0.4)
-                return guest.pings
+                await eventually("keepalive PINGs", lambda: guest.pings >= 2)
 
-            self.assertGreaterEqual(self.run_with_guest(body), 2)
+            self.run_with_guest(body)
         finally:
             guest_fs.PING_INTERVAL_S = old
 
@@ -322,7 +337,7 @@ class GuestFsTests(unittest.TestCase):
                 # Order-matched responses can't recover from a lost one: the
                 # session is dead, and says so immediately.
                 with self.assertRaises(guest_cmd.GuestCommandError):
-                    await asyncio.wait_for(fs.stat(b"/"), 1)
+                    await asyncio.wait_for(fs.stat(b"/"), SOON)
                 guest.hold.set()
 
             self.run_with_guest(body)
@@ -340,10 +355,10 @@ class GuestFsTests(unittest.TestCase):
         try:
             async def body(fs, guest):
                 with self.assertRaises(guest_cmd.GuestCommandError) as cm:
-                    await asyncio.wait_for(fs.call("write", b"x" * (8 * 1024 * 1024), h=1, off=0), 5)
+                    await asyncio.wait_for(fs.call("write", b"x" * (8 * 1024 * 1024), h=1, off=0), SOON)
                 self.assertIn("stopped reading", str(cm.exception))
                 with self.assertRaises(guest_cmd.GuestCommandError):
-                    await asyncio.wait_for(fs.stat(b"/"), 1)
+                    await asyncio.wait_for(fs.stat(b"/"), SOON)
                 guest.closed_by_test.set()
 
             self.run_with_guest(body, guest)
@@ -354,7 +369,7 @@ class GuestFsTests(unittest.TestCase):
         async def body(fs, guest):
             guest.hold = asyncio.Event()
             pending = asyncio.ensure_future(fs.stat(b"/"))
-            await asyncio.sleep(0.1)
+            await eventually("the request to reach the guest", lambda: guest.requests)
 
             async def boom(_n):
                 raise RuntimeError("boom")
@@ -362,10 +377,10 @@ class GuestFsTests(unittest.TestCase):
             fs._reader.readexactly = boom  # next read in the loop blows up
             guest.hold.set()               # ...which the response triggers
             with self.assertRaises(guest_cmd.GuestCommandError) as cm:
-                await asyncio.wait_for(pending, 5)
+                await asyncio.wait_for(pending, SOON)
             self.assertIn("boom", str(cm.exception))
             with self.assertRaises(guest_cmd.GuestCommandError):
-                await asyncio.wait_for(fs.stat(b"/"), 1)
+                await asyncio.wait_for(fs.stat(b"/"), SOON)
 
         self.run_with_guest(body)
 
@@ -386,7 +401,7 @@ class GuestFsTests(unittest.TestCase):
                 await server.wait_closed()
 
         try:
-            asyncio.run(asyncio.wait_for(drive(), 20))
+            asyncio.run(asyncio.wait_for(drive(), 4 * SOON))
         finally:
             guest_fs.CONNECT_TIMEOUT_S = old
 
@@ -407,7 +422,7 @@ class GuestFsTests(unittest.TestCase):
                 server.close()
                 await server.wait_closed()
 
-        asyncio.run(asyncio.wait_for(drive(), 20))
+        asyncio.run(asyncio.wait_for(drive(), 4 * SOON))
 
 
 if __name__ == "__main__":

@@ -21,12 +21,15 @@ Things to know:
 * Only regular files and seekable devices transfer. FIFOs, ttys and sockets can be listed and stat'ed but not read or written.
 * A single read is capped at 4 MiB (the limit advertised to SFTP clients); clients simply ask again for the rest.
 
-To exercise the whole path without a guest, build the Unix-socket stand-in for the agent and run the end-to-end test (needs `asyncssh` and OpenSSH's `scp`/`sftp`):
+## Testing
 
 ```sh
-cargo build --example uds_agent
-python3 -m unittest tests.test_scp_e2e
+nix develop -c tests/run_all.sh
 ```
+
+runs everything that does not need a guest: the Rust agent tests, the Python client and gateway tests, and end-to-end tests that drive real `scp`/`sftp`/`ssh` clients through the gateway. The "guest" in those is `examples/uds_agent.rs`, which serves the real agent session code over a Unix socket on the local machine, so no VM, container or root is needed. CI runs exactly this command.
+
+The flake's dev shell supplies what the tests need beyond the standard library (cargo, OpenSSH's clients, Python with `asyncssh`). Without it, `cargo test` and `python3 -m unittest discover -s tests` still work, and the suites whose prerequisites are missing skip. `run_all.sh` sets `GUESTHOPPER_REQUIRE_ALL_TESTS=1`, which turns such a skip into a failure, so a green CI run means the tests actually ran.
 
 # Distribution
 

@@ -118,5 +118,20 @@
       checks.${system} = {
         inherit dist;
       };
+
+      # Host toolchain for the test suites: `nix develop -c tests/run_all.sh`.
+      # The cross builds above cannot run tests (doCheck = false: a guest
+      # binary is not host-runnable), so the Rust tests and the scp/sftp
+      # end-to-end tests run natively from this shell instead. It supplies
+      # what they need beyond the standard library: cargo, OpenSSH's clients,
+      # and Python with asyncssh.
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [
+          pkgs.cargo
+          pkgs.rustc
+          pkgs.openssh
+          (pkgs.python3.withPackages (ps: [ ps.asyncssh ]))
+        ];
+      };
     };
 }

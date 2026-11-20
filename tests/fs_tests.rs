@@ -15,6 +15,12 @@ use guesthopper::session::run_session;
 use serde_json::{json, Value};
 use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
 
+/// Generous bound for "this should happen promptly": long enough that a busy
+/// CI runner never trips it, far shorter than the timeouts a passing test rules
+/// out (the 60 s idle timeout the sessions here are given, the agent's
+/// two-minute op timeout).
+const SOON: Duration = Duration::from_secs(15);
+
 /// A scratch directory unique to one test, removed on drop.
 struct Scratch(PathBuf);
 
@@ -402,7 +408,7 @@ async fn session_ends_cleanly_when_the_client_disconnects() {
     frame::write_frame(&mut wr, frame::FRAME_REQUEST, br#"{"verb":"fs"}"#).await.unwrap();
     drop(wr);
     drop(rd);
-    tokio::time::timeout(Duration::from_secs(5), session)
+    tokio::time::timeout(SOON, session)
         .await
         .expect("fs session did not end on disconnect")
         .unwrap()
@@ -424,7 +430,7 @@ async fn silent_client_is_timed_out() {
     let (_rd, mut wr) = split(host);
     frame::write_frame(&mut wr, frame::FRAME_REQUEST, br#"{"verb":"fs"}"#).await.unwrap();
     // Hold the connection open but send nothing more.
-    tokio::time::timeout(Duration::from_secs(5), session)
+    tokio::time::timeout(SOON, session)
         .await
         .expect("idle fs session was never torn down")
         .unwrap()
@@ -506,14 +512,14 @@ async fn truncate_by_path_never_blocks_on_a_fifo() {
 
     let mut c = Client::start().await;
     let reply = tokio::time::timeout(
-        Duration::from_secs(5),
+        SOON,
         c.call(json!({"op":"setstat","path":hp(&fifo),"size":0}), b""),
     )
     .await
     .expect("setstat size on a FIFO blocked");
     assert_eq!(reply.0["ok"], false);
     // Opening a FIFO for reading doesn't block either.
-    tokio::time::timeout(Duration::from_secs(5), c.ok(json!({"op":"open","path":hp(&fifo)}), b""))
+    tokio::time::timeout(SOON, c.ok(json!({"op":"open","path":hp(&fifo)}), b""))
         .await
         .expect("open of a FIFO blocked");
 }
