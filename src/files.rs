@@ -31,14 +31,16 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::AsyncRead;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration};
 
 use crate::frame;
-use crate::session::{send, send_error, Cancel, Tx};
+use crate::session::{clip_error, send, send_error, Cancel, Tx};
 
 /// Largest `read` served in one response. Matches the exec path's chunk so the
 /// bounded outbound queue has the same worst-case footprint; a client wanting
@@ -67,8 +69,15 @@ const FS_OP_TIMEOUT: Duration = Duration::from_secs(120);
 pub const FS_MAX_JOBS: usize = 64;
 /// Longest a request waits for a job permit before being refused as busy.
 const FS_ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bytes of received-but-not-yet-served requests one session may hold. The
+/// socket is read while an operation runs (that is how a vanished client is
+/// noticed mid-operation), so pipelined requests queue here; past this budget
+/// reading pauses and the client simply sees backpressure. Sized to hold a
+/// normal client's whole pipeline window (16 x 32 KiB writes) with room to
+/// spare.
+const FS_PENDING_MAX: usize = 1024 * 1024;
 
-static FS_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(FS_MAX_JOBS);
+static FS_JOBS: Semaphore = Semaphore::const_new(FS_MAX_JOBS);
 
 /// Held by a running job; releasing it frees one of the FS_MAX_JOBS slots.
 type JobPermit = tokio::sync::SemaphorePermit<'static>;
@@ -574,6 +583,12 @@ impl FsState {
                 check(unsafe { libc::fstatvfs(f.as_raw_fd(), &mut s) })?;
                 Ok((statvfs_json(&s), none))
             }
+            // Stands in for a syscall wedged in the kernel (unit tests only).
+            #[cfg(test)]
+            "test-block" => {
+                tests::gate_wait();
+                Ok((json!({}), none))
+            }
             // Name the op, but only a short prefix of it: the string is
             // client-controlled and up to a whole inbound frame long, and an
             // error that echoed it (escaped, so several times larger) would let
@@ -680,7 +695,9 @@ fn error_payload(e: &io::Error) -> Vec<u8> {
         "ok": false,
         "kind": error_kind(e),
         "errno": e.raw_os_error().unwrap_or(0),
-        "message": e.to_string(),
+        // Clipped: the text can quote client input at any length (see
+        // MAX_ERROR_LEN), e.g. a parser error repeating a mistyped field.
+        "message": clip_error(&e.to_string()),
     });
     encode_payload(&hdr, &[])
 }
@@ -730,79 +747,137 @@ pub(crate) async fn serve<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let mut state = FsState::default();
-    loop {
-        let next = tokio::select! {
-            biased;
-            _ = cancel.wait() => break,
-            r = timeout(idle_timeout, frame::read_frame(reader)) => r,
-        };
-        let f = match next {
-            // No frame (not even a PING) within idle_timeout: the peer is gone.
-            Err(_elapsed) => {
-                cancel.fire();
-                break;
-            }
-            Ok(Ok(Some(f))) => f,
-            Ok(Ok(None)) | Ok(Err(_)) => break,
-        };
-        if f.ftype != frame::FRAME_FS_REQ {
-            continue; // PING / unknown frames: just liveness
-        }
+    serve_with(reader, tx, cancel, idle_timeout, FS_ADMIT_TIMEOUT.min(idle_timeout)).await
+}
 
-        // File I/O is synchronous; on this single-threaded runtime it would
-        // stall every other session (the console included) for its duration, so
-        // each op runs on a blocking thread. The state moves in and back out.
-        //
-        // A blocking thread cannot be interrupted. If cancel or the op timeout
-        // wins the select below, the session ends and frees its slot at once,
-        // but the thread -- and the handles in the state it holds -- live until
-        // the syscall returns. That is why every open here is non-blocking: a
-        // regular-file operation always returns, and anything that could wait
-        // on a peer forever fails fast instead. What remains -- a regular-file
-        // op stuck in a wedged driver -- is bounded globally by FS_MAX_JOBS.
-        //
-        let permit = tokio::select! {
-            biased;
-            _ = cancel.wait() => break,
-            p = admit_job(FS_ADMIT_TIMEOUT.min(idle_timeout)) => p,
-        };
-        let permit = match permit {
-            Some(p) => p,
-            None => {
-                // Saturated: refuse this one request (keeping the response
-                // stream one-to-one) and leave the session and its handles be.
-                let busy = io::Error::new(
-                    io::ErrorKind::Other,
-                    "agent busy: too many file operations in flight",
-                );
-                send(tx, frame::FRAME_FS_RESP, error_payload(&busy)).await;
-                continue;
+async fn serve_with<R>(
+    reader: &mut R,
+    tx: &Tx,
+    cancel: &Cancel,
+    idle_timeout: Duration,
+    admit_timeout: Duration,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    // Two halves run side by side on this task: `intake` reads frames, `work`
+    // serves the requests in order. They are separate so that the socket keeps
+    // being read while an operation runs or waits for a job permit -- otherwise
+    // a client that disconnects or goes silent mid-operation would hold its
+    // session slot until the operation finished or timed out. Requests that
+    // arrive meanwhile wait in `pending`, each holding its size out of a byte
+    // budget so the queue cannot grow without bound.
+    let budget = Arc::new(Semaphore::new(FS_PENDING_MAX));
+    let (pending_tx, mut pending) = mpsc::unbounded_channel::<(Vec<u8>, OwnedSemaphorePermit)>();
+
+    let intake = async {
+        loop {
+            // One persistent loop owns the reader, so a frame is never
+            // abandoned half-read (read_frame is not cancel-safe).
+            match timeout(idle_timeout, frame::read_frame(reader)).await {
+                // No frame (not even a PING) within idle_timeout: peer is gone.
+                Err(_elapsed) => break,
+                // EOF or a transport error: the client's connection is gone.
+                Ok(Ok(None)) | Ok(Err(_)) => break,
+                Ok(Ok(Some(f))) => {
+                    if f.ftype != frame::FRAME_FS_REQ {
+                        continue; // PING / unknown frames: just liveness
+                    }
+                    // Over budget this waits, which stops the reading: plain
+                    // backpressure (and no liveness checks until work drains).
+                    let cost = f.payload.len().clamp(1, FS_PENDING_MAX) as u32;
+                    let held = match Arc::clone(&budget).acquire_many_owned(cost).await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    if pending_tx.send((f.payload, held)).is_err() {
+                        break;
+                    }
+                }
             }
-        };
-        let job = spawn_job(permit, move || {
-            let resp = state.handle(&f.payload);
-            (state, resp)
-        });
-        let resp = tokio::select! {
-            biased;
-            _ = cancel.wait() => break,
-            r = timeout(FS_OP_TIMEOUT, job) => match r {
-                Ok(Ok((st, resp))) => {
-                    state = st;
-                    resp
+        }
+        // However the reading ended, the client is not coming back: tear the
+        // session down now (abandoning any running operation) so its slot is
+        // released.
+        cancel.fire();
+    };
+
+    let work = async {
+        let mut state = FsState::default();
+        loop {
+            let (payload, held) = tokio::select! {
+                biased;
+                _ = cancel.wait() => break,
+                next = pending.recv() => match next {
+                    Some(item) => item,
+                    None => break,
+                },
+            };
+
+            // File I/O is synchronous; on this single-threaded runtime it would
+            // stall every other session (the console included) for its
+            // duration, so each op runs on a blocking thread. The state moves
+            // in and back out.
+            //
+            // A blocking thread cannot be interrupted. If cancel or the op
+            // timeout wins the select below, the session ends and frees its
+            // slot at once, but the thread -- and the handles in the state it
+            // holds -- live until the syscall returns. That is why every open
+            // here is non-blocking: a regular-file operation always returns,
+            // and anything that could wait on a peer forever fails fast
+            // instead. What remains -- a regular-file op stuck in a wedged
+            // driver -- is bounded globally by FS_MAX_JOBS.
+            let permit = tokio::select! {
+                biased;
+                _ = cancel.wait() => break,
+                p = admit_job(admit_timeout) => p,
+            };
+            let permit = match permit {
+                Some(p) => p,
+                None => {
+                    // Saturated: refuse this one request (keeping the response
+                    // stream one-to-one) and leave the session and its handles
+                    // be.
+                    let busy = io::Error::new(
+                        io::ErrorKind::Other,
+                        "agent busy: too many file operations in flight",
+                    );
+                    send(tx, frame::FRAME_FS_RESP, error_payload(&busy)).await;
+                    continue;
                 }
-                Ok(Err(e)) => {
-                    send_error(tx, &format!("fs operation failed: {e}")).await;
-                    break;
-                }
-                Err(_elapsed) => {
-                    send_error(tx, "fs operation timed out (wedged in the guest kernel?)").await;
-                    break;
-                }
-            },
-        };
-        send(tx, frame::FRAME_FS_RESP, resp).await;
+            };
+            let job = spawn_job(permit, move || {
+                let resp = state.handle(&payload);
+                (state, resp)
+            });
+            // The request has left the queue; give its bytes back to intake.
+            drop(held);
+            let resp = tokio::select! {
+                biased;
+                _ = cancel.wait() => break,
+                r = timeout(FS_OP_TIMEOUT, job) => match r {
+                    Ok(Ok((st, resp))) => {
+                        state = st;
+                        resp
+                    }
+                    Ok(Err(e)) => {
+                        send_error(tx, &format!("fs operation failed: {e}")).await;
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        send_error(tx, "fs operation timed out (wedged in the guest kernel?)").await;
+                        break;
+                    }
+                },
+            };
+            send(tx, frame::FRAME_FS_RESP, resp).await;
+        }
+    };
+
+    // Whichever half finishes first ends the session; the other is dropped.
+    tokio::select! {
+        _ = intake => {}
+        _ = work => {}
     }
     Ok(())
 }
@@ -810,7 +885,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::mpsc as std_mpsc;
+    use std::sync::{Condvar, Mutex};
+
+    // The `test-block` op parks its blocking thread here until a test opens
+    // the gate -- a stand-in for a syscall wedged in the guest kernel.
+    static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+    pub(super) fn gate_wait() {
+        let mut open = GATE.0.lock().unwrap();
+        while !*open {
+            open = GATE.1.wait(open).unwrap();
+        }
+    }
+
+    fn gate_set(open: bool) {
+        *GATE.0.lock().unwrap() = open;
+        GATE.1.notify_all();
+    }
+
+    /// Opens the gate when dropped, so a failing assertion can't leave a
+    /// blocking thread parked (which would hang the runtime's shutdown).
+    struct OpenGateOnDrop;
+
+    impl Drop for OpenGateOnDrop {
+        fn drop(&mut self) {
+            gate_set(true);
+        }
+    }
+
+    fn request(hdr: Value, data: &[u8]) -> Vec<u8> {
+        encode_payload(&hdr, data)
+    }
+
+    fn response(payload: &[u8]) -> Value {
+        serde_json::from_slice(split_payload(payload).unwrap().0).unwrap()
+    }
+
+    const LONG: Duration = Duration::from_secs(30);
 
     // These tests drain the process-global FS_JOBS, so they must not overlap.
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -819,7 +931,7 @@ mod tests {
     async fn abandoned_job_holds_its_permit_until_it_actually_finishes() {
         let _serial = SERIAL.lock().await;
         let before = FS_JOBS.available_permits();
-        let (release, gate) = mpsc::channel::<()>();
+        let (release, gate) = std_mpsc::channel::<()>();
         let permit = admit_job(Duration::from_secs(5)).await.expect("permit");
         let job = spawn_job(permit, move || {
             let _ = gate.recv(); // a wedged syscall
@@ -853,8 +965,7 @@ mod tests {
         // Every job slot is taken by lingering work.
         let all = FS_JOBS.acquire_many(FS_MAX_JOBS as u32).await.unwrap();
         frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &request).await.unwrap();
-        // idle_timeout doubles as the admission bound here; keep it short.
-        let serving = serve(&mut g_rd, &tx, &cancel, Duration::from_millis(300));
+        let serving = serve_with(&mut g_rd, &tx, &cancel, LONG, Duration::from_millis(200));
         tokio::pin!(serving);
         let (ftype, payload) = tokio::select! {
             _ = &mut serving => panic!("session ended instead of answering"),
@@ -875,5 +986,155 @@ mod tests {
         };
         let hdr: Value = serde_json::from_slice(split_payload(&payload).unwrap().0).unwrap();
         assert_eq!(hdr["ok"], true, "{hdr}");
+    }
+
+    /// Start a session whose first request is wedged in `test-block`. Returns
+    /// the host's write half (dropping it disconnects), the response channel,
+    /// and the running session.
+    async fn wedged_session(
+        idle: Duration,
+    ) -> (
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        tokio::sync::mpsc::Receiver<(u8, Vec<u8>)>,
+        Arc<Cancel>,
+        tokio::task::JoinHandle<()>,
+        OpenGateOnDrop,
+    ) {
+        gate_set(false);
+        let (tx, rx) = tokio::sync::mpsc::channel::<(u8, Vec<u8>)>(64);
+        let (host, guest) = tokio::io::duplex(8 << 20);
+        let (mut g_rd, g_wr) = tokio::io::split(guest);
+        let (h_rd, mut h_wr) = tokio::io::split(host);
+        let cancel = Arc::new(Cancel::default());
+        let cancel2 = Arc::clone(&cancel);
+        let session = tokio::spawn(async move {
+            let _keep_open = g_wr; // or the host would see its own EOF
+            serve_with(&mut g_rd, &tx, &cancel2, idle, LONG).await.unwrap();
+        });
+        let block = request(json!({ "op": "test-block" }), &[]);
+        frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &block).await.unwrap();
+        // Let the job reach the gate.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (h_wr, h_rd, rx, cancel, session, OpenGateOnDrop)
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_during_a_wedged_op_ends_the_session_at_once() {
+        // The op would hold the session for FS_OP_TIMEOUT (two minutes); a
+        // client that has gone must free its slot long before that.
+        let _serial = SERIAL.lock().await;
+        let (h_wr, h_rd, _rx, cancel, session, _gate) = wedged_session(LONG).await;
+        assert!(!session.is_finished());
+        drop(h_wr);
+        drop(h_rd);
+        timeout(Duration::from_secs(3), session)
+            .await
+            .expect("session outlived its client while an op was wedged")
+            .unwrap();
+        // The writer and anything else watching must be told too.
+        timeout(Duration::from_secs(1), cancel.wait()).await.expect("cancel not fired");
+    }
+
+    #[tokio::test]
+    async fn silent_client_during_a_wedged_op_hits_the_idle_timeout() {
+        // Connected but sending nothing (not even PINGs) while the op hangs:
+        // the idle timeout must still apply.
+        let _serial = SERIAL.lock().await;
+        let (_h_wr, _h_rd, _rx, _cancel, session, _gate) =
+            wedged_session(Duration::from_millis(300)).await;
+        timeout(Duration::from_secs(3), session)
+            .await
+            .expect("idle timeout was not enforced while an op was wedged")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pings_keep_a_session_alive_through_a_long_op_and_order_is_kept() {
+        let _serial = SERIAL.lock().await;
+        let (mut h_wr, _h_rd, mut rx, _cancel, session, _gate) =
+            wedged_session(Duration::from_millis(400)).await;
+        // Requests pipelined behind the wedged one, plus PINGs for well over
+        // the idle timeout.
+        for path in ["2f", "2f746d70"] {
+            let req = request(json!({ "op": "realpath", "path": path }), &[]);
+            frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &req).await.unwrap();
+        }
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            frame::write_frame(&mut h_wr, frame::FRAME_PING, &[]).await.unwrap();
+        }
+        assert!(!session.is_finished(), "PINGs did not keep the session alive");
+        assert!(rx.try_recv().is_err(), "a response overtook the wedged request");
+
+        gate_set(true);
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let (ftype, payload) = timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+            assert_eq!(ftype, frame::FRAME_FS_RESP);
+            got.push(response(&payload));
+        }
+        assert_eq!(got[0]["ok"], true);
+        assert!(got[0].get("path").is_none(), "first answer must be the blocked op's");
+        assert_eq!(got[1]["path"], "2f");
+        assert!(got[2]["path"].as_str().unwrap().starts_with("2f"));
+    }
+
+    #[tokio::test]
+    async fn requests_past_the_pending_budget_are_delayed_not_lost() {
+        // Far more queued request bytes than FS_PENDING_MAX while an op is
+        // wedged: intake must stop reading (backpressure) rather than buffer
+        // it all, and every request must still be answered, in order.
+        let _serial = SERIAL.lock().await;
+        let (mut h_wr, _h_rd, mut rx, _cancel, session, _gate) = wedged_session(LONG).await;
+        const N: usize = 60;
+        let chunk = vec![0u8; 60 * 1024]; // 60 x 60 KiB = 3.5 MiB > budget
+        let writer = tokio::spawn(async move {
+            for i in 0..N {
+                let req = request(json!({ "op": "write", "h": 4_000_000 + i, "off": 0 }), &chunk);
+                frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &req).await.unwrap();
+            }
+            h_wr
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(rx.try_recv().is_err());
+
+        gate_set(true);
+        let mut answers = 0;
+        while answers < N + 1 {
+            let (_, payload) = timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a queued request was never answered")
+                .unwrap();
+            let hdr = response(&payload);
+            // First the blocked op, then N refusals (no such handle).
+            assert_eq!(hdr["ok"], answers == 0, "response {answers}: {hdr}");
+            answers += 1;
+        }
+        let _h_wr = writer.await.unwrap();
+        assert!(!session.is_finished());
+    }
+
+    #[tokio::test]
+    async fn parser_diagnostics_do_not_echo_frame_sized_input() {
+        // serde quotes the offending value: a huge string where the numeric
+        // handle belongs would otherwise come back whole in the error.
+        let mut state = FsState::default();
+        let huge = "A".repeat(600_000);
+        let resp = state.handle(&request(json!({ "op": "read", "h": huge }), &[]));
+        assert!(resp.len() < 1024, "error response is {} bytes", resp.len());
+        let hdr = response(&resp);
+        assert_eq!(hdr["kind"], "invalid");
+        assert!(hdr["message"].as_str().unwrap().starts_with("invalid fs request json"));
+    }
+
+    #[test]
+    fn clip_error_cuts_on_a_character_boundary() {
+        use crate::session::MAX_ERROR_LEN;
+        assert_eq!(clip_error("short"), "short");
+        let long = "\u{00e9}".repeat(MAX_ERROR_LEN); // 2 bytes each
+        let clipped = clip_error(&long);
+        assert!(clipped.len() <= MAX_ERROR_LEN && clipped.len() >= MAX_ERROR_LEN - 1);
+        assert!(clipped.chars().all(|c| c == '\u{00e9}'));
     }
 }

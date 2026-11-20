@@ -314,6 +314,42 @@ class ScpEndToEndTests(unittest.TestCase):
         self.assertGreater(len(data), 0)
         self.assertLessEqual(len(data), ssh_gateway.FS_READ_LIMIT)
 
+    def test_exec_and_pty_shell_stay_responsive_during_a_transfer(self):
+        # File I/O must not monopolise the agent: with a copy in flight, an
+        # exec and an interactive (pty) shell on other sessions still answer
+        # promptly, and the copy is still going when they do.
+        src = self.host_file("busy.bin", os.urandom(4 * 1024 * 1024))
+        dst = os.path.join(self.guest, "busy.bin")
+        if os.path.exists(dst):
+            os.unlink(dst)
+        # -l: bandwidth limit (kbit/s), so the transfer outlasts the checks.
+        transfer = subprocess.Popen(
+            ["scp", *SSH_OPTS, "-l", "800", "-P", str(self.port), src, self.remote(dst)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            _wait_for(lambda: os.path.exists(dst) and os.path.getsize(dst) > 0, "transfer to start")
+
+            start = time.time()
+            r = subprocess.run(
+                ["ssh", *SSH_OPTS, "-p", str(self.port), "root@127.0.0.1", "echo exec-during-copy"],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual((r.stdout, r.returncode), ("exec-during-copy\n", 0), r.stderr)
+
+            # -tt forces a pty even though stdin is a pipe: the open-pty path.
+            r = subprocess.run(
+                ["ssh", "-tt", *SSH_OPTS, "-p", str(self.port), "root@127.0.0.1"],
+                input="echo pty-during-copy; exit 5\n", capture_output=True, text=True, timeout=10)
+            self.assertIn("pty-during-copy", r.stdout)
+            self.assertEqual(r.returncode, 5, r.stdout + r.stderr)
+            self.assertLess(time.time() - start, 8, "sessions were slow while a transfer ran")
+
+            # Both happened *during* the copy, not after it.
+            self.assertIsNone(transfer.poll(), "transfer ended before the checks did")
+            self.assertLess(os.path.getsize(dst), os.path.getsize(src))
+        finally:
+            transfer.kill()
+            transfer.wait()
+
     def test_shell_and_exec_still_work_alongside_file_transfer(self):
         r = subprocess.run(
             ["ssh", *SSH_OPTS, "-p", str(self.port), "root@127.0.0.1", "echo exec-ok; exit 3"],
