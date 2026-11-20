@@ -110,6 +110,11 @@ class FakeGuest:
 
     def handle(self, req, data):
         op = req["op"]
+        if op in ("read", "write") and req.get("h") not in self.handles:
+            # As the real agent does. (Raising here instead would kill this
+            # connection's task and have asyncio log a traceback mid-suite.)
+            return {"ok": False, "kind": "invalid", "errno": 0,
+                    "message": "not an open file handle"}, b""
         if op == "open":
             if not req.get("create") and req["path"] not in self.files:
                 return {"ok": False, "kind": "noent", "errno": 2,

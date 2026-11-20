@@ -302,6 +302,62 @@ class ScpEndToEndTests(unittest.TestCase):
             _wait_for(lambda: self._agent_sessions_ended() > before,
                       f"guest session to end after the client died ({extra or 'sftp mode'})")
 
+    def test_client_that_stops_reading_cannot_make_the_gateway_buffer_replies(self):
+        # A client pipelines many maximum-size reads, then freezes without
+        # taking a single reply. The gateway must stop fetching file data
+        # rather than queue it all in its own memory -- this is the host side
+        # of the bridge, so the memory at stake is not the guest's.
+        import signal
+        import ssh_gateway
+
+        gateway = self.procs[-1]
+
+        def rss_mib(pid):
+            with open(f"/proc/{pid}/status") as f:
+                return next(int(ln.split()[1]) for ln in f if ln.startswith("VmRSS:")) // 1024
+
+        def state(pid):
+            with open(f"/proc/{pid}/status") as f:
+                return next(ln.split()[1] for ln in f if ln.startswith("State:"))
+
+        big = os.path.join(self.guest, "sparse-pipelined.bin")
+        with open(big, "wb") as f:
+            f.truncate(1024 * 1024 * 1024)
+        requests = 200  # x 4 MiB = 800 MiB of replies if nothing held them back
+        client_src = f"""
+import asyncio, asyncssh, os, signal
+async def main():
+    async with asyncssh.connect("127.0.0.1", {self.port}, username="root", known_hosts=None) as conn:
+        async with conn.start_sftp_client() as sftp:
+            h = sftp._handler
+            fh = await h.open({big.encode()!r}, asyncssh.FXF_READ, asyncssh.SFTPAttrs())
+            size = {ssh_gateway.FS_READ_LIMIT}
+            reads = [asyncio.ensure_future(h.read(fh, i * size, size)) for i in range({requests})]
+            await asyncio.sleep(1)                 # let every request go out
+            os.kill(os.getpid(), signal.SIGSTOP)   # ...and take no replies
+            await asyncio.sleep(3600)
+asyncio.run(main())
+"""
+        before_rss = rss_mib(gateway.pid)
+        before_sessions = self._agent_sessions_ended()
+        client = subprocess.Popen([sys.executable, "-c", client_src],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            _wait_for(lambda: client.poll() is not None or state(client.pid) == "T",
+                      "the client to freeze")
+            self.assertIsNone(client.poll(), "client exited instead of freezing")
+            # Unchecked, the gateway reaches hundreds of MiB within seconds.
+            time.sleep(5)
+            grown = rss_mib(gateway.pid) - before_rss
+            self.assertLess(grown, 100, f"gateway grew {grown} MiB buffering replies")
+        finally:
+            client.send_signal(signal.SIGKILL)
+            client.wait()
+        # The read parked on backpressure must not outlive the client: the
+        # guest session it holds has to be released.
+        _wait_for(lambda: self._agent_sessions_ended() > before_sessions,
+                  "the guest session to end after the frozen client died")
+
     def test_oversized_read_request_is_answered_short_not_buffered(self):
         # A raw SFTP READ may carry any u32 length. The gateway must answer
         # with a bounded chunk rather than fetch (and hold) the whole range.

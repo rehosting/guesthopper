@@ -95,6 +95,16 @@ class ReadFrameTests(unittest.TestCase):
         self.assertEqual(f2, (guest_cmd.FRAME_EXIT, b'{"code":0}'))
 
 
+class _FakeChan:
+    """The little of an asyncssh channel that GuestSFTPServer looks at."""
+
+    def __init__(self):
+        self.closing = False
+
+    def is_closing(self):
+        return self.closing
+
+
 class _FakeFs:
     """Stands in for guest_fs.GuestFs behind a GuestSFTPServer."""
 
@@ -130,7 +140,7 @@ class GuestSFTPServerTests(unittest.TestCase):
     """The SFTP bridge's own logic, with the guest faked out."""
 
     def _server(self, fs):
-        server = sg.GuestSFTPServer(object(), "/nonexistent", 1)
+        server = sg.GuestSFTPServer(_FakeChan(), "/nonexistent", 1)
         server._fs = fs
         return server
 
@@ -148,6 +158,52 @@ class GuestSFTPServerTests(unittest.TestCase):
         self.assertEqual(fs.read_sizes, [sg.FS_READ_LIMIT, 100])
         # Never above what asyncssh advertises to clients as the server limit.
         self.assertLessEqual(sg.FS_READ_LIMIT, sg.asyncssh.sftp.MAX_SFTP_READ_LEN)
+
+    def test_read_waits_while_the_client_is_not_taking_replies(self):
+        # asyncssh queues replies without waiting for the client. A read must
+        # not fetch more guest data while the outbound buffer is full, or a
+        # client that pipelines reads and stops reading makes the gateway hold
+        # every reply.
+        fs = _FakeFs()
+
+        async def drive():
+            write_ok = asyncio.Event()  # clear: the client is behind
+            server = sg.GuestSFTPServer(_FakeChan(), "/nonexistent", 1, write_ok)
+            server._fs = fs
+            read = asyncio.ensure_future(server.read(sg._GuestFile(1), 0, 100))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertFalse(read.done())
+            self.assertEqual(fs.read_sizes, [], "guest was read while the client was behind")
+            write_ok.set()  # the buffer drained
+            return await asyncio.wait_for(read, 30)
+
+        self.assertEqual(asyncio.run(drive()), b"x" * 10)
+        self.assertEqual(fs.read_sizes, [100])
+
+    def test_read_parked_on_backpressure_fails_fast_once_the_client_is_gone(self):
+        # connection_lost releases the wait too. The read must then give up
+        # rather than fetch data nobody will receive -- once for itself and
+        # again for every request the client left queued behind it.
+        fs = _FakeFs()
+
+        async def drive():
+            write_ok = asyncio.Event()
+            chan = _FakeChan()
+            server = sg.GuestSFTPServer(chan, "/nonexistent", 1, write_ok)
+            server._fs = fs
+            read = asyncio.ensure_future(server.read(sg._GuestFile(1), 0, 100))
+            await asyncio.sleep(0)
+            chan.closing = True
+            write_ok.set()
+            with self.assertRaises(sg.asyncssh.SFTPError):
+                await asyncio.wait_for(read, 30)
+            # And one arriving after the disconnect doesn't touch the guest.
+            with self.assertRaises(sg.asyncssh.SFTPError):
+                await server.read(sg._GuestFile(1), 0, 100)
+
+        asyncio.run(drive())
+        self.assertEqual(fs.read_sizes, [])
 
     def test_close_after_the_guest_session_died_does_not_raise(self):
         # asyncssh closes open files during teardown before calling exit(); an
