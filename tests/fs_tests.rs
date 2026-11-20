@@ -580,6 +580,33 @@ async fn realpath_resumes_real_resolution_after_dotdot_cancels_a_missing_compone
 }
 
 #[tokio::test]
+async fn realpath_keeps_the_directory_requirement_of_a_trailing_slash() {
+    // To the kernel `file/` and `file/.` are ENOTDIR. The missing-tail
+    // fallback is for missing components only and must not turn those into a
+    // successful answer naming the file.
+    let dir = Scratch::new();
+    let root = std::fs::canonicalize(&dir.0).unwrap();
+    std::fs::write(root.join("file"), b"").unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    let mut c = Client::start().await;
+
+    let raw = |tail: &str| {
+        let mut p = root.as_os_str().as_bytes().to_vec();
+        p.extend_from_slice(tail.as_bytes());
+        hex(&p)
+    };
+    for tail in ["/file/", "/file/.", "/missing/../file/", "/missing/../file/."] {
+        let (h, _) = c.call(json!({"op":"realpath","path":raw(tail)}), b"").await;
+        assert_eq!(h["ok"], false, "realpath of {tail:?} should fail: {h}");
+    }
+    // Directories, and names that don't exist yet, are still fine that way.
+    for (tail, want) in [("/sub/", "sub"), ("/sub/.", "sub"), ("/newdir/", "newdir"), ("/missing/../sub/", "sub")] {
+        let (r, _) = c.ok(json!({"op":"realpath","path":raw(tail)}), b"").await;
+        assert_eq!(unhex(r["path"].as_str().unwrap()), root.join(want).as_os_str().as_bytes(), "{tail:?}");
+    }
+}
+
+#[tokio::test]
 async fn open_refused_for_a_full_handle_table_has_no_side_effects() {
     // The capacity check must come before the open: a rejected create/truncate
     // that had already run would empty (or create) its target.
