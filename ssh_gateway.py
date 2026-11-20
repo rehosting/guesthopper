@@ -168,11 +168,17 @@ if asyncssh is not None:
             # SFTP/scp server on this channel and every callback below is handed
             # to it instead of the pty/exec bridge.
             self._xfer = None
+            # File-transfer counterpart of _write_resumed: clear while asyncssh's
+            # outbound buffer to the client is full. The SFTP server waits on it
+            # before fetching file data (see GuestSFTPServer.read).
+            self._xfer_write_ok = asyncio.Event()
+            self._xfer_write_ok.set()
 
         def _start_file_transfer(self):
             self._xfer = SSHServerStreamSession(
                 None,
-                lambda chan: GuestSFTPServer(chan, self._uds_path, self._vsock_port),
+                lambda chan: GuestSFTPServer(
+                    chan, self._uds_path, self._vsock_port, self._xfer_write_ok),
                 sftp_version=SFTP_VERSION,
                 allow_scp=True,
             )
@@ -243,6 +249,7 @@ if asyncssh is not None:
 
         def pause_writing(self):
             if self._xfer is not None:
+                self._xfer_write_ok.clear()
                 self._xfer.pause_writing()
                 return
             # asyncssh's outbound buffer to the SSH client is full: stop pulling
@@ -252,6 +259,7 @@ if asyncssh is not None:
 
         def resume_writing(self):
             if self._xfer is not None:
+                self._xfer_write_ok.set()
                 self._xfer.resume_writing()
                 return
             self._write_resumed.set()
@@ -264,6 +272,10 @@ if asyncssh is not None:
 
         def connection_lost(self, exc):
             if self._xfer is not None:
+                # Release a read parked on backpressure: the client is gone, and
+                # the SFTP server must get on to its teardown (which closes the
+                # guest session) rather than wait for a drain that won't come.
+                self._xfer_write_ok.set()
                 self._xfer.connection_lost(exc)
                 return
             for t in self._tasks:
@@ -468,10 +480,13 @@ if asyncssh is not None:
         """asyncssh SFTP server whose filesystem is the *guest's*, reached over
         one vsock ``fs`` session (opened on first use, closed in exit())."""
 
-        def __init__(self, chan, uds_path, vsock_port):
+        def __init__(self, chan, uds_path, vsock_port, write_ok=None):
             super().__init__(chan)
             self._uds_path = uds_path
             self._vsock_port = vsock_port
+            # Set while the SSH client is keeping up with what we send it (the
+            # owning session clears it on pause_writing). None: never wait.
+            self._write_ok = write_ok
             self._fs = None
             self._fs_lock = asyncio.Lock()
 
@@ -523,6 +538,21 @@ if asyncssh is not None:
             # treat a short read as "ask again", and well-behaved ones never
             # exceed the limit we advertise anyway.
             size = min(size, FS_READ_LIMIT)
+            # Backpressure. asyncssh's SFTP server queues each reply for the
+            # client without waiting for it to be taken, and a read turns a
+            # few-byte request into megabytes of reply: a client that pipelines
+            # reads and then stops reading would have us hold all of it. So do
+            # not fetch more file data while the client is behind. Requests are
+            # served one at a time, so this also stops further ones being read,
+            # and at most one reply sits beyond asyncssh's buffer limit.
+            if self._write_ok is not None:
+                await self._write_ok.wait()
+            # The wait also ends when the connection is lost. Don't then fetch
+            # data for a client that is gone -- nor for each of the requests it
+            # left queued behind this one, which would keep the guest session
+            # busy (and its slot held) long after the disconnect.
+            if self.channel.is_closing():
+                raise asyncssh.SFTPConnectionLost("client disconnected")
             return await (await self._guest()).read(file_obj.handle, offset, size)
 
         @_guest_op
