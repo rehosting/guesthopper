@@ -102,7 +102,27 @@ pub(crate) async fn send(tx: &Tx, ftype: u8, payload: Vec<u8>) {
     let _ = tx.send((ftype, payload)).await;
 }
 
+/// Longest diagnostic text put in an ERROR frame or an `fs` error response.
+/// Messages routinely quote client input -- a JSON parser error repeats the
+/// offending value, which can be a whole inbound frame -- and a client that
+/// never reads could otherwise pin that much per queued reply on a guest with
+/// little RAM. No genuine diagnostic needs more than this.
+pub(crate) const MAX_ERROR_LEN: usize = 512;
+
+/// `msg` cut to at most [`MAX_ERROR_LEN`] bytes, on a character boundary.
+pub(crate) fn clip_error(msg: &str) -> &str {
+    if msg.len() <= MAX_ERROR_LEN {
+        return msg;
+    }
+    let mut end = MAX_ERROR_LEN;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    &msg[..end]
+}
+
 pub(crate) async fn send_error(tx: &Tx, msg: &str) {
+    let msg = clip_error(msg);
     let payload = serde_json::to_vec(&serde_json::json!({ "message": msg }))
         .unwrap_or_else(|_| Vec::new());
     send(tx, frame::FRAME_ERROR, payload).await;

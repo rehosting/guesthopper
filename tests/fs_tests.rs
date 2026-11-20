@@ -468,6 +468,33 @@ async fn unsupported_verb_error_does_not_echo_a_huge_verb() {
 }
 
 #[tokio::test]
+async fn malformed_request_diagnostics_are_bounded_end_to_end() {
+    // Both parsers quote the offending value in their error; neither may send
+    // a frame-sized value back.
+    let mut c = Client::start().await;
+    c.send(json!({ "op": "read", "h": "B".repeat(500_000) }), b"").await;
+    let Frame { payload, .. } = frame::read_frame(&mut c.rd).await.unwrap().expect("frame");
+    assert!(payload.len() < 1024, "fs error response is {} bytes", payload.len());
+
+    let (host, guest) = duplex(1 << 20);
+    let (g_rd, g_wr) = split(guest);
+    tokio::spawn(run_session(
+        g_rd,
+        g_wr,
+        Arc::new("/bin/sh".to_string()),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        None,
+    ));
+    let (mut rd, mut wr) = split(host);
+    let req = serde_json::to_vec(&json!({ "verb": "exec", "deadline": "C".repeat(500_000) })).unwrap();
+    frame::write_frame(&mut wr, frame::FRAME_REQUEST, &req).await.unwrap();
+    let Frame { ftype, payload } = frame::read_frame(&mut rd).await.unwrap().expect("frame");
+    assert_eq!(ftype, frame::FRAME_ERROR);
+    assert!(payload.len() < 1024, "ERROR frame is {} bytes", payload.len());
+}
+
+#[tokio::test]
 async fn truncate_by_path_never_blocks_on_a_fifo() {
     // A blocking open of a reader-less FIFO would park the blocking thread for
     // good (nothing can interrupt it) and hold the session until the op
