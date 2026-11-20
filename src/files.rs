@@ -76,6 +76,17 @@ const FS_ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// normal client's whole pipeline window (16 x 32 KiB writes) with room to
 /// spare.
 const FS_PENDING_MAX: usize = 1024 * 1024;
+/// Charged against FS_PENDING_MAX for every queued request on top of its
+/// payload. A queued request costs memory even when empty (its buffer header,
+/// its budget permit, its slot in the queue), so without this a peer could
+/// park a million empty requests under a "1 MiB" budget. With it the queue
+/// holds at most FS_PENDING_MAX / FS_PENDING_OVERHEAD (4096) requests.
+const FS_PENDING_OVERHEAD: usize = 256;
+
+/// What a queued request of `len` payload bytes costs from the pending budget.
+fn pending_cost(len: usize) -> u32 {
+    len.saturating_add(FS_PENDING_OVERHEAD).min(FS_PENDING_MAX) as u32
+}
 
 static FS_JOBS: Semaphore = Semaphore::const_new(FS_MAX_JOBS);
 
@@ -237,22 +248,28 @@ fn check(rc: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Convert seconds to whatever integer type this libc's `tv_sec` is, refusing
+/// values it cannot hold. On 32-bit musl that type is still 32 bits, where a
+/// plain cast would silently wrap a post-2038 time into 1901-1970 and report
+/// success. (Generic so the deprecated `time_t` alias is never named; the type
+/// comes from the field being assigned.)
+fn to_time<T: TryFrom<i64>>(secs: i64) -> io::Result<T> {
+    T::try_from(secs).map_err(|_| invalid("timestamp out of range for this system"))
+}
+
 /// `[atime, mtime]` for utimensat/futimens; an absent one is left untouched.
-fn timespecs(atime: Option<i64>, mtime: Option<i64>) -> [libc::timespec; 2] {
-    let one = |t: Option<i64>| {
+fn timespecs(atime: Option<i64>, mtime: Option<i64>) -> io::Result<[libc::timespec; 2]> {
+    let one = |t: Option<i64>| -> io::Result<libc::timespec> {
         // Zeroed rather than a struct literal: some targets' `timespec` carries
         // private padding fields.
         let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
         match t {
-            // `as _` (not `as libc::time_t`): the alias is flagged deprecated
-            // on 32-bit musl, where it is still 32 bits wide. Whatever width
-            // this libc declares is the one its utimensat/futimens expect.
-            Some(secs) => ts.tv_sec = secs as _,
+            Some(secs) => ts.tv_sec = to_time(secs)?,
             None => ts.tv_nsec = libc::UTIME_OMIT as _,
         }
-        ts
+        Ok(ts)
     };
-    [one(atime), one(mtime)]
+    Ok([one(atime)?, one(mtime)?])
 }
 
 /// Resolve `p` to an absolute path. Unlike `canonicalize`, a path whose tail
@@ -267,9 +284,18 @@ fn realpath(p: &Path) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(p)
     };
-    if let Ok(real) = fs::canonicalize(&abs) {
-        return Ok(real);
+    match fs::canonicalize(&abs) {
+        Ok(real) => return Ok(real),
+        // Only a missing component is something to work around. ENOTDIR
+        // (`file/`), EACCES, ELOOP and the rest are the answer.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
+    // `Path::components` drops a trailing `/` or `/.`, but to the kernel those
+    // mean "this must be a directory"; remember it so the walk below cannot
+    // quietly accept a regular file there.
+    let raw = abs.as_os_str().as_bytes();
+    let wants_dir = raw.ends_with(b"/") || raw.ends_with(b"/.");
     let mut out = PathBuf::from("/");
     // How many components at the end of `out` were appended lexically because
     // they do not exist. While it is zero, `out` is a real, resolved path and
@@ -304,6 +330,9 @@ fn realpath(p: &Path) -> io::Result<PathBuf> {
                 Err(e) => return Err(e),
             },
         }
+    }
+    if wants_dir && missing == 0 && !out.is_dir() {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
     }
     Ok(out)
 }
@@ -622,7 +651,7 @@ impl FsState {
                 f.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
             }
             if req.atime.is_some() || req.mtime.is_some() {
-                let ts = timespecs(req.atime, req.mtime);
+                let ts = timespecs(req.atime, req.mtime)?;
                 // SAFETY: fd is live; ts points at two valid timespecs.
                 check(unsafe { libc::futimens(fd, ts.as_ptr()) })?;
             }
@@ -662,7 +691,7 @@ impl FsState {
             }
         }
         if req.atime.is_some() || req.mtime.is_some() {
-            let ts = timespecs(req.atime, req.mtime);
+            let ts = timespecs(req.atime, req.mtime)?;
             let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
             // SAFETY: valid path and timespec pointers.
             check(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), flags) })?;
@@ -785,7 +814,7 @@ where
                     }
                     // Over budget this waits, which stops the reading: plain
                     // backpressure (and no liveness checks until work drains).
-                    let cost = f.payload.len().clamp(1, FS_PENDING_MAX) as u32;
+                    let cost = pending_cost(f.payload.len());
                     let held = match Arc::clone(&budget).acquire_many_owned(cost).await {
                         Ok(p) => p,
                         Err(_) => break,
@@ -924,12 +953,27 @@ mod tests {
 
     const LONG: Duration = Duration::from_secs(30);
 
+    /// Take the serial lock and wait for jobs left behind by earlier tests to
+    /// finish. A test that abandons a wedged job opens the gate as it ends,
+    /// but that job's thread releases its permit a moment later -- which would
+    /// otherwise skew the next test's permit arithmetic.
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = SERIAL.lock().await;
+        for _ in 0..500 {
+            if FS_JOBS.available_permits() == FS_MAX_JOBS {
+                return guard;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("jobs from an earlier test never finished");
+    }
+
     // These tests drain the process-global FS_JOBS, so they must not overlap.
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn abandoned_job_holds_its_permit_until_it_actually_finishes() {
-        let _serial = SERIAL.lock().await;
+        let _serial = serial().await;
         let before = FS_JOBS.available_permits();
         let (release, gate) = std_mpsc::channel::<()>();
         let permit = admit_job(Duration::from_secs(5)).await.expect("permit");
@@ -954,7 +998,7 @@ mod tests {
 
     #[tokio::test]
     async fn saturated_agent_refuses_requests_but_keeps_the_session() {
-        let _serial = SERIAL.lock().await;
+        let _serial = serial().await;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(u8, Vec<u8>)>(8);
         let (host, guest) = tokio::io::duplex(1 << 16);
         let (mut g_rd, _g_wr) = tokio::io::split(guest);
@@ -1001,9 +1045,25 @@ mod tests {
         tokio::task::JoinHandle<()>,
         OpenGateOnDrop,
     ) {
+        wedged_session_buf(idle, 8 << 20).await
+    }
+
+    /// As `wedged_session`, with a chosen transport buffer size (a small one
+    /// makes the agent's own reading -- or not reading -- visible to a writer).
+    async fn wedged_session_buf(
+        idle: Duration,
+        transport_buf: usize,
+    ) -> (
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        tokio::sync::mpsc::Receiver<(u8, Vec<u8>)>,
+        Arc<Cancel>,
+        tokio::task::JoinHandle<()>,
+        OpenGateOnDrop,
+    ) {
         gate_set(false);
         let (tx, rx) = tokio::sync::mpsc::channel::<(u8, Vec<u8>)>(64);
-        let (host, guest) = tokio::io::duplex(8 << 20);
+        let (host, guest) = tokio::io::duplex(transport_buf);
         let (mut g_rd, g_wr) = tokio::io::split(guest);
         let (h_rd, mut h_wr) = tokio::io::split(host);
         let cancel = Arc::new(Cancel::default());
@@ -1023,7 +1083,7 @@ mod tests {
     async fn client_disconnect_during_a_wedged_op_ends_the_session_at_once() {
         // The op would hold the session for FS_OP_TIMEOUT (two minutes); a
         // client that has gone must free its slot long before that.
-        let _serial = SERIAL.lock().await;
+        let _serial = serial().await;
         let (h_wr, h_rd, _rx, cancel, session, _gate) = wedged_session(LONG).await;
         assert!(!session.is_finished());
         drop(h_wr);
@@ -1040,7 +1100,7 @@ mod tests {
     async fn silent_client_during_a_wedged_op_hits_the_idle_timeout() {
         // Connected but sending nothing (not even PINGs) while the op hangs:
         // the idle timeout must still apply.
-        let _serial = SERIAL.lock().await;
+        let _serial = serial().await;
         let (_h_wr, _h_rd, _rx, _cancel, session, _gate) =
             wedged_session(Duration::from_millis(300)).await;
         timeout(Duration::from_secs(3), session)
@@ -1051,7 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn pings_keep_a_session_alive_through_a_long_op_and_order_is_kept() {
-        let _serial = SERIAL.lock().await;
+        let _serial = serial().await;
         let (mut h_wr, _h_rd, mut rx, _cancel, session, _gate) =
             wedged_session(Duration::from_millis(400)).await;
         // Requests pipelined behind the wedged one, plus PINGs for well over
@@ -1085,7 +1145,7 @@ mod tests {
         // Far more queued request bytes than FS_PENDING_MAX while an op is
         // wedged: intake must stop reading (backpressure) rather than buffer
         // it all, and every request must still be answered, in order.
-        let _serial = SERIAL.lock().await;
+        let _serial = serial().await;
         let (mut h_wr, _h_rd, mut rx, _cancel, session, _gate) = wedged_session(LONG).await;
         const N: usize = 60;
         let chunk = vec![0u8; 60 * 1024]; // 60 x 60 KiB = 3.5 MiB > budget
@@ -1136,5 +1196,59 @@ mod tests {
         let clipped = clip_error(&long);
         assert!(clipped.len() <= MAX_ERROR_LEN && clipped.len() >= MAX_ERROR_LEN - 1);
         assert!(clipped.chars().all(|c| c == '\u{00e9}'));
+    }
+
+    #[tokio::test]
+    async fn empty_requests_cannot_pile_up_past_the_pending_budget() {
+        // An empty request still costs memory to queue. With a wedged op and a
+        // small transport buffer, a flood of them must hit backpressure after
+        // a few thousand -- not be read (and held) by the hundred thousand.
+        let _serial = serial().await;
+        let (mut h_wr, _h_rd, _rx, _cancel, _session, _gate) =
+            wedged_session_buf(LONG, 16 * 1024).await;
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&sent);
+        let flood = tokio::spawn(async move {
+            for _ in 0..200_000 {
+                if frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &[]).await.is_err() {
+                    break;
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let n = sent.load(std::sync::atomic::Ordering::Relaxed);
+        flood.abort();
+        // Queue cap, plus what fits in the 16 KiB transport (5 bytes a frame),
+        // plus the one the reader holds while it waits for budget.
+        let cap = FS_PENDING_MAX / FS_PENDING_OVERHEAD + 16 * 1024 / 5 + 2;
+        assert!(n >= FS_PENDING_MAX / FS_PENDING_OVERHEAD / 2, "flood barely ran: {n}");
+        assert!(n <= cap, "{n} empty requests accepted; expected at most {cap}");
+    }
+
+    #[test]
+    fn pending_cost_charges_overhead_and_never_exceeds_the_budget() {
+        assert_eq!(pending_cost(0) as usize, FS_PENDING_OVERHEAD);
+        assert_eq!(pending_cost(1000) as usize, 1000 + FS_PENDING_OVERHEAD);
+        // A frame bigger than the whole budget must still be admissible.
+        assert_eq!(pending_cost(16 * 1024 * 1024) as usize, FS_PENDING_MAX);
+        assert_eq!(pending_cost(usize::MAX) as usize, FS_PENDING_MAX);
+        // A normal client's full pipeline window fits without backpressure.
+        assert!(16 * pending_cost(32 * 1024 + 64) as usize <= FS_PENDING_MAX);
+    }
+
+    #[test]
+    fn timestamps_a_32_bit_time_t_cannot_hold_are_refused_not_wrapped() {
+        // 2,200,000,000 (year 2039) wraps to 1903 through a plain `as i32`.
+        assert!(to_time::<i32>(2_200_000_000).is_err());
+        assert!(to_time::<i32>(-3_000_000_000).is_err());
+        assert_eq!(to_time::<i32>(2_000_000_000).unwrap(), 2_000_000_000);
+        assert_eq!(to_time::<i64>(2_200_000_000).unwrap(), 2_200_000_000);
+        // And the failure surfaces from timespecs as an ordinary op error.
+        if std::mem::size_of::<libc::time_t>() == 4 {
+            assert!(timespecs(None, Some(2_200_000_000)).is_err());
+        } else {
+            assert!(timespecs(None, Some(2_200_000_000)).is_ok());
+        }
     }
 }
