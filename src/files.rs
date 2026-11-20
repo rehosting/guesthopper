@@ -55,6 +55,47 @@ const READDIR_MAX: usize = 128;
 /// blocking thread so it never stalls other sessions, but without a bound this
 /// session would hold its slot forever.
 const FS_OP_TIMEOUT: Duration = Duration::from_secs(120);
+/// File operations that may be on blocking threads at once, across every
+/// session. A session whose op times out (or whose client vanishes mid-op)
+/// ends and frees its slot, but the op's thread and its whole handle table live
+/// on until the syscall returns -- and a new session can then start another.
+/// Without a global bound, a guest with a wedged filesystem or device could
+/// accumulate such threads and descriptors without limit. The permit is held by
+/// the job itself, so an abandoned job keeps counting until it really ends.
+/// Sized to the default session cap: healthy sessions (one op each at a time)
+/// never wait on it.
+pub const FS_MAX_JOBS: usize = 64;
+/// Longest a request waits for a job permit before being refused as busy.
+const FS_ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+static FS_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(FS_MAX_JOBS);
+
+/// Held by a running job; releasing it frees one of the FS_MAX_JOBS slots.
+type JobPermit = tokio::sync::SemaphorePermit<'static>;
+
+/// Wait up to `admit` for a job permit. `None` means the agent is saturated.
+/// The wait is async, so a session that goes away while queued simply stops
+/// waiting and never starts its job.
+async fn admit_job(admit: Duration) -> Option<JobPermit> {
+    match timeout(admit, FS_JOBS.acquire()).await {
+        Ok(Ok(permit)) => Some(permit),
+        // Elapsed, or the semaphore closed (it never is).
+        _ => None,
+    }
+}
+
+/// Run `f` on a blocking thread. The permit moves into the job and is released
+/// only when `f` returns -- even if the caller has stopped waiting for it.
+fn spawn_job<T, F>(permit: JobPermit, f: F) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -161,6 +202,24 @@ fn attrs(m: &fs::Metadata) -> Value {
     })
 }
 
+// The casts are no-ops on 64-bit hosts but needed where the fields are 32-bit.
+#[allow(clippy::unnecessary_cast)]
+fn statvfs_json(s: &libc::statvfs) -> Value {
+    json!({
+        "bsize": s.f_bsize as u64,
+        "frsize": s.f_frsize as u64,
+        "blocks": s.f_blocks as u64,
+        "bfree": s.f_bfree as u64,
+        "bavail": s.f_bavail as u64,
+        "files": s.f_files as u64,
+        "ffree": s.f_ffree as u64,
+        "favail": s.f_favail as u64,
+        "fsid": s.f_fsid as u64,
+        "flag": s.f_flag as u64,
+        "namemax": s.f_namemax as u64,
+    })
+}
+
 fn check(rc: libc::c_int) -> io::Result<()> {
     if rc < 0 {
         Err(io::Error::last_os_error())
@@ -191,8 +250,8 @@ fn timespecs(atime: Option<i64>, mtime: Option<i64>) -> [libc::timespec; 2] {
 /// does not exist yet still resolves (SFTP clients realpath an upload
 /// destination before creating it). The part that exists is resolved by the
 /// kernel one component at a time -- so symlinks and `..` behave exactly as
-/// they would for a real lookup -- and only the components past the first
-/// missing one are normalized lexically (nothing there can be a symlink).
+/// they would for a real lookup -- and only components that do not exist are
+/// normalized lexically (nothing there can be a symlink).
 fn realpath(p: &Path) -> io::Result<PathBuf> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -203,29 +262,38 @@ fn realpath(p: &Path) -> io::Result<PathBuf> {
         return Ok(real);
     }
     let mut out = PathBuf::from("/");
-    let mut exists = true;
+    // How many components at the end of `out` were appended lexically because
+    // they do not exist. While it is zero, `out` is a real, resolved path and
+    // the next component is looked up through the kernel; a `..` that removes
+    // the last missing component puts us back in that state, so anything after
+    // it (symlinks included) resolves for real again.
+    let mut missing = 0usize;
     for c in abs.components() {
-        if exists {
-            match c {
-                Component::RootDir | Component::CurDir | Component::Prefix(_) => continue,
-                Component::ParentDir | Component::Normal(_) => {}
+        match c {
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            Component::ParentDir if missing > 0 => {
+                out.pop();
+                missing -= 1;
             }
-            match fs::canonicalize(out.join(c)) {
-                Ok(real) => {
-                    out = real;
-                    continue;
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => exists = false,
+            Component::Normal(name) if missing > 0 => {
+                out.push(name);
+                missing += 1;
+            }
+            Component::ParentDir | Component::Normal(_) => match fs::canonicalize(out.join(c)) {
+                Ok(real) => out = real,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => match c {
+                    Component::Normal(name) => {
+                        out.push(name);
+                        missing = 1;
+                    }
+                    // `..` of a directory that vanished under us.
+                    _ => {
+                        out.pop();
+                    }
+                },
                 // ENOTDIR, EACCES, ELOOP...: a real lookup would fail too.
                 Err(e) => return Err(e),
-            }
-        }
-        match c {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::Normal(name) => out.push(name),
-            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            },
         }
     }
     Ok(out)
@@ -311,13 +379,21 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 impl FsState {
-    fn insert(&mut self, h: Handle) -> io::Result<u32> {
+    /// Refuse a new handle when the table is full. Called *before* the open it
+    /// guards: an open can create or truncate its target, and a request that is
+    /// going to be rejected must not have done that first.
+    fn check_capacity(&self) -> io::Result<()> {
         if self.handles.len() >= MAX_HANDLES {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!("too many open handles (max {MAX_HANDLES})"),
             ));
         }
+        Ok(())
+    }
+
+    fn insert(&mut self, h: Handle) -> io::Result<u32> {
+        self.check_capacity()?;
         loop {
             self.next = self.next.wrapping_add(1);
             if !self.handles.contains_key(&self.next) {
@@ -353,6 +429,7 @@ impl FsState {
             }
             "open" => {
                 let p = decode_path(&req.path, "path")?;
+                self.check_capacity()?;
                 let file = open_file(&p, req, 0)?;
                 let h = self.insert(Handle::File { file, append: req.append })?;
                 Ok((json!({ "h": h }), none))
@@ -401,6 +478,7 @@ impl FsState {
             }
             "opendir" => {
                 let p = decode_path(&req.path, "path")?;
+                self.check_capacity()?;
                 let h = self.insert(Handle::Dir(fs::read_dir(&p)?))?;
                 Ok((json!({ "h": h }), none))
             }
@@ -484,22 +562,17 @@ impl FsState {
                 let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
                 // SAFETY: `c` is a valid NUL-terminated path, `s` a valid out-pointer.
                 check(unsafe { libc::statvfs(c.as_ptr(), &mut s) })?;
-                Ok((
-                    json!({
-                        "bsize": s.f_bsize as u64,
-                        "frsize": s.f_frsize as u64,
-                        "blocks": s.f_blocks as u64,
-                        "bfree": s.f_bfree as u64,
-                        "bavail": s.f_bavail as u64,
-                        "files": s.f_files as u64,
-                        "ffree": s.f_ffree as u64,
-                        "favail": s.f_favail as u64,
-                        "fsid": s.f_fsid as u64,
-                        "flag": s.f_flag as u64,
-                        "namemax": s.f_namemax as u64,
-                    }),
-                    none,
-                ))
+                Ok((statvfs_json(&s), none))
+            }
+            "fstatvfs" => {
+                // By handle, not by the path it was opened with: the file may
+                // have been renamed or unlinked since, or the path may now name
+                // something on another filesystem.
+                let (f, _) = self.file(req)?;
+                let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+                // SAFETY: a live descriptor and a valid out-pointer.
+                check(unsafe { libc::fstatvfs(f.as_raw_fd(), &mut s) })?;
+                Ok((statvfs_json(&s), none))
             }
             // Name the op, but only a short prefix of it: the string is
             // client-controlled and up to a whole inbound frame long, and an
@@ -591,23 +664,25 @@ impl FsState {
                 .map_err(|e| invalid(&format!("invalid fs request json: {e}")))?;
             self.op(&req, data)
         });
-        let (hdr, data) = match result {
+        match result {
             Ok((mut hdr, data)) => {
                 hdr["ok"] = Value::Bool(true);
-                (hdr, data)
+                encode_payload(&hdr, &data)
             }
-            Err(e) => (
-                json!({
-                    "ok": false,
-                    "kind": error_kind(&e),
-                    "errno": e.raw_os_error().unwrap_or(0),
-                    "message": e.to_string(),
-                }),
-                Vec::new(),
-            ),
-        };
-        encode_payload(&hdr, &data)
+            Err(e) => error_payload(&e),
+        }
     }
+}
+
+/// The `ok: false` response payload for a failed request.
+fn error_payload(e: &io::Error) -> Vec<u8> {
+    let hdr = json!({
+        "ok": false,
+        "kind": error_kind(e),
+        "errno": e.raw_os_error().unwrap_or(0),
+        "message": e.to_string(),
+    });
+    encode_payload(&hdr, &[])
 }
 
 fn error_kind(e: &io::Error) -> &'static str {
@@ -684,8 +759,28 @@ where
         // but the thread -- and the handles in the state it holds -- live until
         // the syscall returns. That is why every open here is non-blocking: a
         // regular-file operation always returns, and anything that could wait
-        // on a peer forever fails fast instead.
-        let job = tokio::task::spawn_blocking(move || {
+        // on a peer forever fails fast instead. What remains -- a regular-file
+        // op stuck in a wedged driver -- is bounded globally by FS_MAX_JOBS.
+        //
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.wait() => break,
+            p = admit_job(FS_ADMIT_TIMEOUT.min(idle_timeout)) => p,
+        };
+        let permit = match permit {
+            Some(p) => p,
+            None => {
+                // Saturated: refuse this one request (keeping the response
+                // stream one-to-one) and leave the session and its handles be.
+                let busy = io::Error::new(
+                    io::ErrorKind::Other,
+                    "agent busy: too many file operations in flight",
+                );
+                send(tx, frame::FRAME_FS_RESP, error_payload(&busy)).await;
+                continue;
+            }
+        };
+        let job = spawn_job(permit, move || {
             let resp = state.handle(&f.payload);
             (state, resp)
         });
@@ -710,4 +805,75 @@ where
         send(tx, frame::FRAME_FS_RESP, resp).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    // These tests drain the process-global FS_JOBS, so they must not overlap.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn abandoned_job_holds_its_permit_until_it_actually_finishes() {
+        let _serial = SERIAL.lock().await;
+        let before = FS_JOBS.available_permits();
+        let (release, gate) = mpsc::channel::<()>();
+        let permit = admit_job(Duration::from_secs(5)).await.expect("permit");
+        let job = spawn_job(permit, move || {
+            let _ = gate.recv(); // a wedged syscall
+        });
+        // The session gives up on the job (op timeout / client gone)...
+        drop(job);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // ...but the thread is still there, so it must still count.
+        assert_eq!(FS_JOBS.available_permits(), before - 1);
+
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            if FS_JOBS.available_permits() == before {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("permit was not released when the job finished");
+    }
+
+    #[tokio::test]
+    async fn saturated_agent_refuses_requests_but_keeps_the_session() {
+        let _serial = SERIAL.lock().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u8, Vec<u8>)>(8);
+        let (host, guest) = tokio::io::duplex(1 << 16);
+        let (mut g_rd, _g_wr) = tokio::io::split(guest);
+        let (_h_rd, mut h_wr) = tokio::io::split(host);
+        let cancel = Cancel::default();
+        let request = encode_payload(&json!({ "op": "realpath", "path": "2f" }), &[]);
+
+        // Every job slot is taken by lingering work.
+        let all = FS_JOBS.acquire_many(FS_MAX_JOBS as u32).await.unwrap();
+        frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &request).await.unwrap();
+        // idle_timeout doubles as the admission bound here; keep it short.
+        let serving = serve(&mut g_rd, &tx, &cancel, Duration::from_millis(300));
+        tokio::pin!(serving);
+        let (ftype, payload) = tokio::select! {
+            _ = &mut serving => panic!("session ended instead of answering"),
+            r = rx.recv() => r.expect("a response"),
+        };
+        assert_eq!(ftype, frame::FRAME_FS_RESP);
+        let (hdr, _) = split_payload(&payload).unwrap();
+        let hdr: Value = serde_json::from_slice(hdr).unwrap();
+        assert_eq!(hdr["ok"], false);
+        assert!(hdr["message"].as_str().unwrap().contains("busy"), "{hdr}");
+
+        // Once work drains, the same session serves the next request.
+        drop(all);
+        frame::write_frame(&mut h_wr, frame::FRAME_FS_REQ, &request).await.unwrap();
+        let (_, payload) = tokio::select! {
+            _ = &mut serving => panic!("session ended instead of answering"),
+            r = rx.recv() => r.expect("a response"),
+        };
+        let hdr: Value = serde_json::from_slice(split_payload(&payload).unwrap().0).unwrap();
+        assert_eq!(hdr["ok"], true, "{hdr}");
+    }
 }

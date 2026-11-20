@@ -535,6 +535,65 @@ async fn realpath_follows_symlinks_in_the_existing_part_of_a_new_path() {
 }
 
 #[tokio::test]
+async fn realpath_resumes_real_resolution_after_dotdot_cancels_a_missing_component() {
+    // `missing/..` is back at an existing directory, so what follows must be
+    // resolved for real again: `link/..` is real/, not the directory holding
+    // the symlink.
+    let dir = Scratch::new();
+    let root = std::fs::canonicalize(&dir.0).unwrap();
+    std::fs::create_dir_all(root.join("real/sub")).unwrap();
+    std::os::unix::fs::symlink("real/sub", root.join("link")).unwrap();
+    let mut c = Client::start().await;
+
+    assert_eq!(resolve(&mut c, root.join("missing/../link/../new")).await, root.join("real/new"));
+    assert_eq!(resolve(&mut c, root.join("a/b/../../link/new")).await, root.join("real/sub/new"));
+    // Still lexical while inside the missing part.
+    assert_eq!(resolve(&mut c, root.join("a/b/../c")).await, root.join("a/c"));
+    assert_eq!(resolve(&mut c, root.join("missing/..")).await, root);
+}
+
+#[tokio::test]
+async fn open_refused_for_a_full_handle_table_has_no_side_effects() {
+    // The capacity check must come before the open: a rejected create/truncate
+    // that had already run would empty (or create) its target.
+    let dir = Scratch::new();
+    let (keep, victim, fresh) = (dir.path("keep"), dir.path("victim"), dir.path("fresh"));
+    std::fs::write(&keep, b"x").unwrap();
+    std::fs::write(&victim, b"precious").unwrap();
+    let mut c = Client::start().await;
+    loop {
+        let (h, _) = c.call(json!({"op":"open","path":hp(&keep)}), b"").await;
+        if h["ok"] != true {
+            break;
+        }
+    }
+    let trunc = json!({"op":"open","path":hp(&victim),"write":true,"create":true,"trunc":true});
+    assert_eq!(c.call(trunc, b"").await.0["ok"], false);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    let create = json!({"op":"open","path":hp(&fresh),"write":true,"create":true});
+    assert_eq!(c.call(create, b"").await.0["ok"], false);
+    assert!(!fresh.exists());
+    assert_eq!(c.call(json!({"op":"opendir","path":hp(&dir.0)}), b"").await.0["ok"], false);
+}
+
+#[tokio::test]
+async fn fstatvfs_follows_the_open_handle_not_its_original_path() {
+    let dir = Scratch::new();
+    let p = dir.path("f");
+    std::fs::write(&p, b"x").unwrap();
+    let mut c = Client::start().await;
+    let (o, _) = c.ok(json!({"op":"open","path":hp(&p)}), b"").await;
+    std::fs::remove_file(&p).unwrap();
+
+    // The path is gone, the handle is not.
+    assert_eq!(c.err(json!({"op":"statvfs","path":hp(&p)})).await, "noent");
+    let (v, _) = c.ok(json!({"op":"fstatvfs","h":o["h"]}), b"").await;
+    assert!(v["bsize"].as_u64().unwrap() > 0);
+    assert!(v["namemax"].as_u64().unwrap() > 0);
+    assert_eq!(c.err(json!({"op":"fstatvfs","h":9999})).await, "invalid");
+}
+
+#[tokio::test]
 async fn open_accepts_the_flag_combinations_sftp_clients_send() {
     let dir = Scratch::new();
     let mut c = Client::start().await;

@@ -49,7 +49,8 @@ FS_PIPELINE = 16
 # read is not end-of-file -- an empty one is).
 FS_READ_LIMIT = 4 * 1024 * 1024
 
-# Bound on the vsock handshake, and on waiting for any one response. The agent
+# Bound on the vsock handshake, and on sending any one request or waiting for
+# its response. The agent
 # gives a single file operation 120 s (FS_OP_TIMEOUT in files.rs) before it
 # abandons the session, so a response later than that is never coming -- e.g.
 # the agent is at its session cap and this connection is parked in its accept
@@ -178,11 +179,23 @@ class GuestFs:
         """PING so the agent's idle timeout never trips on a quiet session."""
         while self._dead is None:
             await asyncio.sleep(PING_INTERVAL_S)
-            try:
-                self._writer.write(encode_frame(FRAME_PING))
-                await self._writer.drain()
-            except (OSError, ConnectionError):
+            self._writer.write(encode_frame(FRAME_PING))
+            if not await self._flush("keepalive"):
                 break
+
+    async def _flush(self, what):
+        """Wait for buffered frames to reach the socket. A guest that stops
+        reading leaves the socket full and this waiting for ever, with no
+        response timeout armed yet to notice -- so the wait is bounded, and a
+        lapse (or a write error) kills the session. Returns False if it did."""
+        try:
+            await asyncio.wait_for(self._writer.drain(), CALL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            self._fail(GuestCommandError(
+                f"guest stopped reading: fs {what} not sent in {CALL_TIMEOUT_S}s"))
+        except (OSError, ConnectionError) as e:
+            self._fail(GuestCommandError(f"fs session write failed: {e}"))
+        return self._dead is None
 
     def _fail(self, err):
         if self._dead is None:
@@ -213,10 +226,8 @@ class GuestFs:
         # write order, so the two must not interleave across concurrent calls.
         self._pending.append(fut)
         self._writer.write(frame)
-        try:
-            await self._writer.drain()
-        except (OSError, ConnectionError) as e:
-            self._fail(GuestCommandError(f"fs session write failed: {e}"))
+        # If this fails it has failed `fut` too, so the await below raises.
+        await self._flush(f"{op!r} request")
         try:
             payload = await asyncio.wait_for(fut, CALL_TIMEOUT_S)
         except asyncio.TimeoutError:
@@ -350,3 +361,6 @@ class GuestFs:
 
     async def statvfs(self, path):
         return (await self.call("statvfs", path=_path(path)))[0]
+
+    async def fstatvfs(self, handle):
+        return (await self.call("fstatvfs", h=handle))[0]
