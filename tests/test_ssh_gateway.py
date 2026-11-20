@@ -6,9 +6,11 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import guest_cmd  # noqa: E402
 import ssh_gateway as sg  # noqa: E402  (imports even without asyncssh: SSH glue is guarded)
+from prereq import requires  # noqa: E402
 
 
 def _frame(ftype, payload=b""):
@@ -123,7 +125,7 @@ class _FakeFs:
             yield name, {"mode": 0o100644, "size": 1}
 
 
-@unittest.skipUnless(sg.asyncssh is not None, "asyncssh not installed")
+@requires(asyncssh=sg.asyncssh is not None)
 class GuestSFTPServerTests(unittest.TestCase):
     """The SFTP bridge's own logic, with the guest faked out."""
 

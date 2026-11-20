@@ -4,7 +4,8 @@ Real OpenSSH clients -> ssh_gateway.py (asyncssh SFTP server) -> guest_fs.py ->
 the real agent session code, served over a Unix socket by the ``uds_agent``
 example in place of a guest + vsock. Files land on this machine's filesystem.
 
-Skipped unless everything it needs is present:
+Skipped unless everything it needs is present (or failed, if
+GUESTHOPPER_REQUIRE_ALL_TESTS is set -- see prereq.py and run_all.sh):
   * asyncssh importable by this interpreter,
   * ``scp`` / ``sftp`` on PATH,
   * the agent stand-in built:  cargo build --example uds_agent
@@ -23,6 +24,9 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from prereq import requires  # noqa: E402
 
 try:
     import asyncssh  # noqa: F401
@@ -43,6 +47,12 @@ def _find_agent():
 
 
 AGENT = _find_agent()
+# A deliberately slow copy for tests that need one in flight: scp's -l caps
+# bandwidth (kbit/s), so this much data takes about five minutes -- far longer
+# than any check made while it runs. The tests kill it when they are done.
+SLOW = ["-l", "800"]
+SLOW_TRANSFER_BYTES = 32 * 1024 * 1024
+
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
@@ -64,7 +74,12 @@ def _short_tmpdir():
     return tempfile.mkdtemp(prefix="scpe2e", dir=base if len(base) < 60 else "/tmp")
 
 
-def _wait_for(predicate, what, timeout=15):
+# How long to wait for something that should happen promptly. Every wait polls
+# for the event itself, so a slow or busy machine only makes a test slower.
+SOON = 60
+
+
+def _wait_for(predicate, what, timeout=SOON):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -78,9 +93,11 @@ def _listening(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-@unittest.skipUnless(HAVE_ASYNCSSH, "asyncssh not installed")
-@unittest.skipUnless(shutil.which("scp") and shutil.which("sftp"), "OpenSSH scp/sftp not on PATH")
-@unittest.skipUnless(AGENT, "uds_agent not built (cargo build --example uds_agent)")
+@requires(
+    asyncssh=HAVE_ASYNCSSH,
+    openssh=(all(shutil.which(tool) for tool in ("ssh", "scp", "sftp")), "ssh/scp/sftp on PATH"),
+    uds_agent=(AGENT, "cargo build --example uds_agent"),
+)
 class ScpEndToEndTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -268,15 +285,14 @@ class ScpEndToEndTests(unittest.TestCase):
         # Each scp holds one of the agent's limited session slots. A client
         # that dies part-way must not strand it (the gateway keeps PINGing a
         # session it never closes, and the agent would keep it forever).
-        src = self.host_file("slow.bin", os.urandom(4 * 1024 * 1024))
+        src = self.host_file("slow.bin", os.urandom(SLOW_TRANSFER_BYTES))
         for extra in ([], ["-O"]):
             before = self._agent_sessions_ended()
             dst = os.path.join(self.guest, "slow.bin")
             if os.path.exists(dst):
                 os.unlink(dst)
-            # -l: bandwidth limit (kbit/s) so the copy is still running when killed.
             p = subprocess.Popen(
-                ["scp", *SSH_OPTS, *extra, "-l", "800", "-P", str(self.port), src, self.remote(dst)],
+                ["scp", *SSH_OPTS, *extra, *SLOW, "-P", str(self.port), src, self.remote(dst)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _wait_for(lambda: os.path.exists(dst) and os.path.getsize(dst) > 0,
                       f"transfer to start ({extra or 'sftp mode'})")
@@ -318,30 +334,29 @@ class ScpEndToEndTests(unittest.TestCase):
         # File I/O must not monopolise the agent: with a copy in flight, an
         # exec and an interactive (pty) shell on other sessions still answer
         # promptly, and the copy is still going when they do.
-        src = self.host_file("busy.bin", os.urandom(4 * 1024 * 1024))
+        src = self.host_file("busy.bin", os.urandom(SLOW_TRANSFER_BYTES))
         dst = os.path.join(self.guest, "busy.bin")
         if os.path.exists(dst):
             os.unlink(dst)
-        # -l: bandwidth limit (kbit/s), so the transfer outlasts the checks.
         transfer = subprocess.Popen(
-            ["scp", *SSH_OPTS, "-l", "800", "-P", str(self.port), src, self.remote(dst)],
+            ["scp", *SSH_OPTS, *SLOW, "-P", str(self.port), src, self.remote(dst)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             _wait_for(lambda: os.path.exists(dst) and os.path.getsize(dst) > 0, "transfer to start")
 
-            start = time.time()
+            # Bounded by SOON, against a copy that would block for minutes if
+            # file I/O held up the agent's other sessions.
             r = subprocess.run(
                 ["ssh", *SSH_OPTS, "-p", str(self.port), "root@127.0.0.1", "echo exec-during-copy"],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=SOON)
             self.assertEqual((r.stdout, r.returncode), ("exec-during-copy\n", 0), r.stderr)
 
             # -tt forces a pty even though stdin is a pipe: the open-pty path.
             r = subprocess.run(
                 ["ssh", "-tt", *SSH_OPTS, "-p", str(self.port), "root@127.0.0.1"],
-                input="echo pty-during-copy; exit 5\n", capture_output=True, text=True, timeout=10)
+                input="echo pty-during-copy; exit 5\n", capture_output=True, text=True, timeout=SOON)
             self.assertIn("pty-during-copy", r.stdout)
             self.assertEqual(r.returncode, 5, r.stdout + r.stderr)
-            self.assertLess(time.time() - start, 8, "sessions were slow while a transfer ran")
 
             # Both happened *during* the copy, not after it.
             self.assertIsNone(transfer.poll(), "transfer ended before the checks did")
