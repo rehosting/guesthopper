@@ -22,12 +22,14 @@ pub const FRAME_STDIN_EOF: u8 = 3;
 pub const FRAME_PING: u8 = 4;
 // SIGNAL=4 reserved for a later slice.
 pub const FRAME_RESIZE: u8 = 5; // pty window size {rows, cols}
+pub const FRAME_FS_REQ: u8 = 6; // `fs` verb request (see files.rs)
 
 // Guest -> host.
 pub const FRAME_STDOUT: u8 = 16;
 pub const FRAME_STDERR: u8 = 17;
 pub const FRAME_EXIT: u8 = 18;
 pub const FRAME_ERROR: u8 = 19;
+pub const FRAME_FS_RESP: u8 = 20; // `fs` verb response (see files.rs)
 
 /// Absolute hard ceiling on a frame payload. The wire length is a `u32`, so this
 /// also guards `write_frame`'s `as u32` cast against silent truncation. The
@@ -41,7 +43,7 @@ pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// advertised length for every concurrent session at once; at the old 16 MiB that
 /// was ~1 GiB across the default 64 sessions -- and a single 16 MiB frame alone
 /// can OOM a 32 MiB firmware guest. Real inbound frames are tiny (keystrokes, a
-/// resize JSON, an exec string, or a <=32 KiB stdin chunk), so 1 MiB is ~16x
+/// resize JSON, an exec string, or a <=32 KiB stdin / file-write chunk), so 1 MiB is ~16x
 /// headroom over anything legitimate while shrinking the worst case ~16x.
 pub const DEFAULT_MAX_INBOUND_FRAME_LEN: usize = 1024 * 1024;
 

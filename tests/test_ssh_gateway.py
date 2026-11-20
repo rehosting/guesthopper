@@ -6,9 +6,11 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import guest_cmd  # noqa: E402
 import ssh_gateway as sg  # noqa: E402  (imports even without asyncssh: SSH glue is guarded)
+from prereq import requires  # noqa: E402
 
 
 def _frame(ftype, payload=b""):
@@ -91,6 +93,145 @@ class ReadFrameTests(unittest.TestCase):
         f1, f2 = self._read_all(data, count=2)
         self.assertEqual(f1, (guest_cmd.FRAME_STDOUT, b"a"))
         self.assertEqual(f2, (guest_cmd.FRAME_EXIT, b'{"code":0}'))
+
+
+class _FakeChan:
+    """The little of an asyncssh channel that GuestSFTPServer looks at."""
+
+    def __init__(self):
+        self.closing = False
+
+    def is_closing(self):
+        return self.closing
+
+
+class _FakeFs:
+    """Stands in for guest_fs.GuestFs behind a GuestSFTPServer."""
+
+    def __init__(self):
+        self.read_sizes = []
+        self.dead = False
+        self.names = []
+
+    async def read(self, handle, offset, size):
+        self.read_sizes.append(size)
+        return b"x" * min(size, 10)
+
+    async def close_handle(self, handle):
+        if self.dead:
+            raise guest_cmd.GuestCommandError("guest closed the fs session")
+        raise sg.GuestFsError("invalid", "not an open handle")
+
+    async def stat(self, path, follow=True):
+        return {"mode": 0o040755, "size": 0}
+
+    async def fstatvfs(self, handle):
+        self.fstatvfs_handles = getattr(self, "fstatvfs_handles", []) + [handle]
+        return dict(bsize=4096, frsize=4096, blocks=10, bfree=5, bavail=4,
+                    files=100, ffree=50, favail=40, fsid=1, flag=0, namemax=255)
+
+    async def scandir(self, path):
+        for name in self.names:
+            yield name, {"mode": 0o100644, "size": 1}
+
+
+@requires(asyncssh=sg.asyncssh is not None)
+class GuestSFTPServerTests(unittest.TestCase):
+    """The SFTP bridge's own logic, with the guest faked out."""
+
+    def _server(self, fs):
+        server = sg.GuestSFTPServer(_FakeChan(), "/nonexistent", 1)
+        server._fs = fs
+        return server
+
+    def test_read_size_from_the_client_is_clamped(self):
+        # An SFTP client may ask for any u32 length; passing it through would
+        # make the gateway buffer that much guest data per request.
+        fs = _FakeFs()
+
+        async def drive():
+            server = self._server(fs)
+            await server.read(sg._GuestFile(1), 0, 0xFFFFFFFF)
+            await server.read(sg._GuestFile(1), 0, 100)
+
+        asyncio.run(drive())
+        self.assertEqual(fs.read_sizes, [sg.FS_READ_LIMIT, 100])
+        # Never above what asyncssh advertises to clients as the server limit.
+        self.assertLessEqual(sg.FS_READ_LIMIT, sg.asyncssh.sftp.MAX_SFTP_READ_LEN)
+
+    def test_read_waits_while_the_client_is_not_taking_replies(self):
+        # asyncssh queues replies without waiting for the client. A read must
+        # not fetch more guest data while the outbound buffer is full, or a
+        # client that pipelines reads and stops reading makes the gateway hold
+        # every reply.
+        fs = _FakeFs()
+
+        async def drive():
+            write_ok = asyncio.Event()  # clear: the client is behind
+            server = sg.GuestSFTPServer(_FakeChan(), "/nonexistent", 1, write_ok)
+            server._fs = fs
+            read = asyncio.ensure_future(server.read(sg._GuestFile(1), 0, 100))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertFalse(read.done())
+            self.assertEqual(fs.read_sizes, [], "guest was read while the client was behind")
+            write_ok.set()  # the buffer drained
+            return await asyncio.wait_for(read, 30)
+
+        self.assertEqual(asyncio.run(drive()), b"x" * 10)
+        self.assertEqual(fs.read_sizes, [100])
+
+    def test_read_parked_on_backpressure_fails_fast_once_the_client_is_gone(self):
+        # connection_lost releases the wait too. The read must then give up
+        # rather than fetch data nobody will receive -- once for itself and
+        # again for every request the client left queued behind it.
+        fs = _FakeFs()
+
+        async def drive():
+            write_ok = asyncio.Event()
+            chan = _FakeChan()
+            server = sg.GuestSFTPServer(chan, "/nonexistent", 1, write_ok)
+            server._fs = fs
+            read = asyncio.ensure_future(server.read(sg._GuestFile(1), 0, 100))
+            await asyncio.sleep(0)
+            chan.closing = True
+            write_ok.set()
+            with self.assertRaises(sg.asyncssh.SFTPError):
+                await asyncio.wait_for(read, 30)
+            # And one arriving after the disconnect doesn't touch the guest.
+            with self.assertRaises(sg.asyncssh.SFTPError):
+                await server.read(sg._GuestFile(1), 0, 100)
+
+        asyncio.run(drive())
+        self.assertEqual(fs.read_sizes, [])
+
+    def test_close_after_the_guest_session_died_does_not_raise(self):
+        # asyncssh closes open files during teardown before calling exit(); an
+        # exception there would skip exit() and the channel close.
+        fs = _FakeFs()
+        fs.dead = True
+        asyncio.run(self._server(fs).close(sg._GuestFile(1)))
+
+    def test_close_refused_by_a_live_guest_is_still_an_sftp_error(self):
+        with self.assertRaises(sg.asyncssh.SFTPError):
+            asyncio.run(self._server(_FakeFs()).close(sg._GuestFile(1)))
+
+    def test_fstatvfs_asks_the_guest_about_the_handle_not_a_remembered_path(self):
+        # The file may have been renamed or unlinked since it was opened; only
+        # the handle still identifies it (and its filesystem).
+        fs = _FakeFs()
+        attrs = asyncio.run(self._server(fs).fstatvfs(sg._GuestFile(7)))
+        self.assertEqual(fs.fstatvfs_handles, [7])
+        self.assertEqual((attrs.bsize, attrs.bavail, attrs.namemax), (4096, 4, 255))
+
+    def test_directory_listing_drops_names_that_are_not_single_components(self):
+        fs = _FakeFs()
+        fs.names = [b"ok", b"../escape", b"a/b", b"", b"..", b".", b"also-ok"]
+
+        async def drive():
+            return [n.filename async for n in self._server(fs).scandir(b"/d")]
+
+        self.assertEqual(asyncio.run(drive()), [b".", b"..", b"ok", b"also-ok"])
 
 
 if __name__ == "__main__":

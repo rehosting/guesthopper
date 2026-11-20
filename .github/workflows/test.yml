@@ -1,9 +1,15 @@
-name: Check that the code compiles
+name: Test and build
 
-# Build guesthopper for every guest arch through this repo's OWN flake
-# (`nix build .#dist` cross-builds all arches into the /igloo_static fragment
-# penguin consumes). Self-contained -- no longer borrows penguin-tools'
-# machinery. The Python host-client unit tests still run here.
+# Two things, both through this repo's OWN flake (self-contained -- no
+# penguin-tools machinery):
+#
+# 1. Run the tests natively on the runner (`nix develop -c tests/run_all.sh`):
+#    the Rust agent tests, the Python client/gateway tests, and the scp/sftp
+#    end-to-end tests against a stand-in agent. Nothing may skip -- a missing
+#    prerequisite fails the job rather than quietly passing it.
+# 2. Build guesthopper for every guest arch (`nix build .#dist` cross-builds
+#    all arches into the /igloo_static fragment penguin consumes). Those builds
+#    cannot run tests themselves: a guest binary is not host-runnable.
 
 on:
   pull_request:
@@ -19,9 +25,6 @@ jobs:
       XDG_CACHE_HOME: /home/runner/_work/.cache
     steps:
       - uses: actions/checkout@v4
-
-      - name: Test Python client
-        run: python3 -m unittest discover -s tests
 
       - name: Prepare runner directories
         run: mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
@@ -44,6 +47,11 @@ jobs:
           cache-backend: cachix
           cachix-name: rehosting-tools
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      # cargo, OpenSSH's clients and Python+asyncssh all come from the flake's
+      # dev shell, so nothing needs installing on the runner image.
+      - name: Run all host tests (Rust, Python, scp/sftp end to end)
+        run: nix develop --accept-flake-config -c tests/run_all.sh
 
       - name: Build guesthopper for all guest arches (this checkout)
         run: |

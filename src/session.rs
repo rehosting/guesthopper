@@ -3,7 +3,9 @@
 //! so we do not multiplex logical channels in-band). The session reads a
 //! `REQUEST` frame, runs it, and streams `STDOUT`/`STDERR` as they are produced
 //! (not buffered-after-exit), forwarding host `STDIN`, and emits `EXIT` on
-//! close. Later slices add `open-pty` / `run-script` verbs on the same frames.
+//! close. Later slices add `open-pty` / `run-script` verbs on the same frames;
+//! the `fs` verb (file transfer for the SSH gateway's scp/sftp) lives in
+//! `files.rs`.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
@@ -70,11 +72,11 @@ pub struct Cancel {
 }
 
 impl Cancel {
-    fn fire(&self) {
+    pub(crate) fn fire(&self) {
         self.fired.store(true, Ordering::SeqCst);
         self.notify.notify_waiters();
     }
-    async fn wait(&self) {
+    pub(crate) async fn wait(&self) {
         loop {
             if self.fired.load(Ordering::SeqCst) {
                 return;
@@ -93,14 +95,34 @@ impl Cancel {
     }
 }
 
-type Tx = Sender<(u8, Vec<u8>)>;
+pub(crate) type Tx = Sender<(u8, Vec<u8>)>;
 
-async fn send(tx: &Tx, ftype: u8, payload: Vec<u8>) {
+pub(crate) async fn send(tx: &Tx, ftype: u8, payload: Vec<u8>) {
     // A closed receiver just means the peer went away; drop the frame.
     let _ = tx.send((ftype, payload)).await;
 }
 
-async fn send_error(tx: &Tx, msg: &str) {
+/// Longest diagnostic text put in an ERROR frame or an `fs` error response.
+/// Messages routinely quote client input -- a JSON parser error repeats the
+/// offending value, which can be a whole inbound frame -- and a client that
+/// never reads could otherwise pin that much per queued reply on a guest with
+/// little RAM. No genuine diagnostic needs more than this.
+pub(crate) const MAX_ERROR_LEN: usize = 512;
+
+/// `msg` cut to at most [`MAX_ERROR_LEN`] bytes, on a character boundary.
+pub(crate) fn clip_error(msg: &str) -> &str {
+    if msg.len() <= MAX_ERROR_LEN {
+        return msg;
+    }
+    let mut end = MAX_ERROR_LEN;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    &msg[..end]
+}
+
+pub(crate) async fn send_error(tx: &Tx, msg: &str) {
+    let msg = clip_error(msg);
     let payload = serde_json::to_vec(&serde_json::json!({ "message": msg }))
         .unwrap_or_else(|_| Vec::new());
     send(tx, frame::FRAME_ERROR, payload).await;
@@ -282,8 +304,12 @@ where
     match req.verb.as_str() {
         "exec" => exec(reader, tx, &shell, req, &cancel, idle_timeout, default_deadline).await,
         "open-pty" => open_pty(reader, tx, &shell, req, &cancel, idle_timeout).await,
+        "fs" => crate::files::serve(reader, tx, &cancel, idle_timeout).await,
         other => {
-            send_error(tx, &format!("unsupported verb: {other:?}")).await;
+            // Only a short prefix: the verb is client-controlled and can be a
+            // whole inbound frame long (see the same guard in files.rs).
+            let name: String = other.chars().take(32).collect();
+            send_error(tx, &format!("unsupported verb: {name:?}")).await;
             Ok(())
         }
     }

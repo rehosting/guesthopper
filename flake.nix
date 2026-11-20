@@ -66,6 +66,7 @@
       #   guesthopper/guest_cmd.py                         host-side client (arch-independent)
       #   guesthopper/telnet_gateway.py                    host-side telnet front door (arch-independent)
       #   guesthopper/ssh_gateway.py                       host-side SSH front door (arch-independent)
+      #   guesthopper/guest_fs.py                          host-side file-service client used by ssh_gateway.py
       dist = pkgs.runCommand "guesthopper-dist"
         {
           nativeBuildInputs = with pkgs.buildPackages; [ coreutils ];
@@ -101,6 +102,9 @@
           # penguin's python env). Penguin runs it at
           # /igloo_static/guesthopper/ssh_gateway.py.
           cp ${self}/ssh_gateway.py "$out/guesthopper/ssh_gateway.py"
+          # Async client for the guest agent's `fs` verb; ssh_gateway.py imports it
+          # to serve scp/sftp, so it must sit beside it.
+          cp ${self}/guest_fs.py "$out/guesthopper/guest_fs.py"
 
           chmod -R u+w "$out"
         '';
@@ -113,6 +117,21 @@
 
       checks.${system} = {
         inherit dist;
+      };
+
+      # Host toolchain for the test suites: `nix develop -c tests/run_all.sh`.
+      # The cross builds above cannot run tests (doCheck = false: a guest
+      # binary is not host-runnable), so the Rust tests and the scp/sftp
+      # end-to-end tests run natively from this shell instead. It supplies
+      # what they need beyond the standard library: cargo, OpenSSH's clients,
+      # and Python with asyncssh.
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [
+          pkgs.cargo
+          pkgs.rustc
+          pkgs.openssh
+          (pkgs.python3.withPackages (ps: [ ps.asyncssh ]))
+        ];
       };
     };
 }
