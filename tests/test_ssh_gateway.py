@@ -113,6 +113,11 @@ class _FakeFs:
     async def stat(self, path, follow=True):
         return {"mode": 0o040755, "size": 0}
 
+    async def fstatvfs(self, handle):
+        self.fstatvfs_handles = getattr(self, "fstatvfs_handles", []) + [handle]
+        return dict(bsize=4096, frsize=4096, blocks=10, bfree=5, bavail=4,
+                    files=100, ffree=50, favail=40, fsid=1, flag=0, namemax=255)
+
     async def scandir(self, path):
         for name in self.names:
             yield name, {"mode": 0o100644, "size": 1}
@@ -134,8 +139,8 @@ class GuestSFTPServerTests(unittest.TestCase):
 
         async def drive():
             server = self._server(fs)
-            await server.read(sg._GuestFile(1, b"/f"), 0, 0xFFFFFFFF)
-            await server.read(sg._GuestFile(1, b"/f"), 0, 100)
+            await server.read(sg._GuestFile(1), 0, 0xFFFFFFFF)
+            await server.read(sg._GuestFile(1), 0, 100)
 
         asyncio.run(drive())
         self.assertEqual(fs.read_sizes, [sg.FS_READ_LIMIT, 100])
@@ -147,11 +152,19 @@ class GuestSFTPServerTests(unittest.TestCase):
         # exception there would skip exit() and the channel close.
         fs = _FakeFs()
         fs.dead = True
-        asyncio.run(self._server(fs).close(sg._GuestFile(1, b"/f")))
+        asyncio.run(self._server(fs).close(sg._GuestFile(1)))
 
     def test_close_refused_by_a_live_guest_is_still_an_sftp_error(self):
         with self.assertRaises(sg.asyncssh.SFTPError):
-            asyncio.run(self._server(_FakeFs()).close(sg._GuestFile(1, b"/f")))
+            asyncio.run(self._server(_FakeFs()).close(sg._GuestFile(1)))
+
+    def test_fstatvfs_asks_the_guest_about_the_handle_not_a_remembered_path(self):
+        # The file may have been renamed or unlinked since it was opened; only
+        # the handle still identifies it (and its filesystem).
+        fs = _FakeFs()
+        attrs = asyncio.run(self._server(fs).fstatvfs(sg._GuestFile(7)))
+        self.assertEqual(fs.fstatvfs_handles, [7])
+        self.assertEqual((attrs.bsize, attrs.bavail, attrs.namemax), (4096, 4, 255))
 
     def test_directory_listing_drops_names_that_are_not_single_components(self):
         fs = _FakeFs()

@@ -447,17 +447,22 @@ if asyncssh is not None:
             nlink=attrs.get("nlink"),
         )
 
+    def _to_vfs_attrs(v):
+        """Guest statvfs dict (files.rs `statvfs_json`) -> asyncssh SFTPVFSAttrs."""
+        return asyncssh.SFTPVFSAttrs(
+            v["bsize"], v["frsize"], v["blocks"], v["bfree"], v["bavail"],
+            v["files"], v["ffree"], v["favail"], 0, v["flag"], v["namemax"])
+
     def _setstat_fields(attrs):
         """The subset of an SFTPAttrs the guest can apply (absent ones None)."""
         return dict(size=attrs.size, uid=attrs.uid, gid=attrs.gid,
                     mode=attrs.permissions, atime=attrs.atime, mtime=attrs.mtime)
 
     class _GuestFile:
-        """An open guest file: the agent's handle plus the path it came from."""
+        """An open guest file, identified by the agent's handle for it."""
 
-        def __init__(self, handle, path):
+        def __init__(self, handle):
             self.handle = handle
-            self.path = path
 
     class GuestSFTPServer(asyncssh.SFTPServer):
         """asyncssh SFTP server whose filesystem is the *guest's*, reached over
@@ -497,7 +502,7 @@ if asyncssh is not None:
                 excl=bool(pflags & asyncssh.FXF_EXCL),
                 mode=attrs.permissions,
             )
-            return _GuestFile(handle, path)
+            return _GuestFile(handle)
 
         async def close(self, file_obj):
             try:
@@ -604,13 +609,13 @@ if asyncssh is not None:
 
         @_guest_op
         async def statvfs(self, path):
-            v = await (await self._guest()).statvfs(path)
-            return asyncssh.SFTPVFSAttrs(
-                v["bsize"], v["frsize"], v["blocks"], v["bfree"], v["bavail"],
-                v["files"], v["ffree"], v["favail"], 0, v["flag"], v["namemax"])
+            return _to_vfs_attrs(await (await self._guest()).statvfs(path))
 
+        @_guest_op
         async def fstatvfs(self, file_obj):
-            return await self.statvfs(file_obj.path)
+            # By handle: the path it was opened with may since have been
+            # renamed, removed, or replaced by something on another filesystem.
+            return _to_vfs_attrs(await (await self._guest()).fstatvfs(file_obj.handle))
 
         @_guest_op
         async def fsync(self, file_obj):

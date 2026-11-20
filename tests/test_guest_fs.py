@@ -52,9 +52,11 @@ class FakeGuest:
         self.hold = None       # if set, an Event responses wait on (to force pipelining)
         self.connections = 0
         self.closed = asyncio.Event()
+        self.closed_by_test = asyncio.Event()
         self.reject_verb = False
         self.oversize_reads = False  # misbehaving guest: more bytes than asked
         self.mute_handshake = False  # accept the connection but never say OK
+        self.stop_reading = False    # complete the handshake, then read nothing
 
     async def serve(self, reader, writer):
         self.connections += 1
@@ -65,6 +67,9 @@ class FakeGuest:
                 return
             port = line.decode().strip().split(" ", 1)[1]
             writer.write(f"OK {port}\n".encode())
+            if self.stop_reading:
+                await self.closed_by_test.wait()
+                return
             while True:
                 hdr = await reader.readexactly(5)
                 payload = await reader.readexactly(int.from_bytes(hdr[1:5], "big"))
@@ -321,6 +326,27 @@ class GuestFsTests(unittest.TestCase):
                 guest.hold.set()
 
             self.run_with_guest(body)
+        finally:
+            guest_fs.CALL_TIMEOUT_S = old
+
+    def test_request_that_cannot_be_sent_times_out_and_kills_the_session(self):
+        # A guest that stops reading leaves the socket full, and the call stuck
+        # *sending* -- before any response timeout is armed. One frame far
+        # larger than a socket buffer guarantees that is where it is stuck.
+        guest = FakeGuest()
+        guest.stop_reading = True
+        old = guest_fs.CALL_TIMEOUT_S
+        guest_fs.CALL_TIMEOUT_S = 0.3
+        try:
+            async def body(fs, guest):
+                with self.assertRaises(guest_cmd.GuestCommandError) as cm:
+                    await asyncio.wait_for(fs.call("write", b"x" * (8 * 1024 * 1024), h=1, off=0), 5)
+                self.assertIn("stopped reading", str(cm.exception))
+                with self.assertRaises(guest_cmd.GuestCommandError):
+                    await asyncio.wait_for(fs.stat(b"/"), 1)
+                guest.closed_by_test.set()
+
+            self.run_with_guest(body, guest)
         finally:
             guest_fs.CALL_TIMEOUT_S = old
 
