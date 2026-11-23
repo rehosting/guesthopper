@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import json
 import os
 import struct
@@ -95,14 +97,41 @@ class ReadFrameTests(unittest.TestCase):
         self.assertEqual(f2, (guest_cmd.FRAME_EXIT, b'{"code":0}'))
 
 
+class _FakeTransport:
+    def __init__(self):
+        self.buffered = 0
+
+    def get_write_buffer_size(self):
+        return self.buffered
+
+
+class _FakeConn:
+    def __init__(self, chan):
+        self._chan = chan
+        self._transport = _FakeTransport()
+        self.aborted = False
+
+    def abort(self):
+        self.aborted = True
+        self._chan.closing = True
+
+
 class _FakeChan:
     """The little of an asyncssh channel that GuestSFTPServer looks at."""
 
     def __init__(self):
         self.closing = False
+        self.buffered = 0          # bytes beyond the client's SSH window
+        self.conn = _FakeConn(self)
 
     def is_closing(self):
         return self.closing
+
+    def get_write_buffer_size(self):
+        return self.buffered
+
+    def get_connection(self):
+        return self.conn
 
 
 class _FakeFs:
@@ -204,6 +233,76 @@ class GuestSFTPServerTests(unittest.TestCase):
 
         asyncio.run(drive())
         self.assertEqual(fs.read_sizes, [])
+
+    def test_read_waits_on_the_socket_backlog_whatever_the_ssh_window(self):
+        # The client picks its SSH window. With a huge one asyncssh never
+        # pauses (everything is "within the window") and replies pile up in the
+        # connection's socket buffer instead, so that is checked directly.
+        fs = _FakeFs()
+
+        async def drive():
+            write_ok = asyncio.Event()
+            write_ok.set()  # asyncssh's flow control sees nothing wrong
+            chan = _FakeChan()
+            chan.conn._transport.buffered = sg.REPLY_BACKLOG_MAX + 1
+            server = sg.GuestSFTPServer(chan, "/nonexistent", 1, write_ok, stall_timeout=60)
+            server._fs = fs
+            read = asyncio.ensure_future(server.read(sg._GuestFile(1), 0, 100))
+            await asyncio.sleep(4 * sg.CLIENT_POLL_S)
+            self.assertFalse(read.done())
+            self.assertEqual(fs.read_sizes, [], "guest was read with a full socket buffer")
+            chan.conn._transport.buffered = sg.REPLY_BACKLOG_MAX  # client caught up
+            await asyncio.wait_for(read, 30)
+            self.assertFalse(chan.conn.aborted)
+
+        asyncio.run(drive())
+        self.assertEqual(fs.read_sizes, [100])
+
+    def test_client_that_takes_nothing_is_disconnected_after_the_stall_timeout(self):
+        # Otherwise a connected-but-frozen client pins its guest session for
+        # good: the gateway's keepalive keeps that session alive on its behalf.
+        fs = _FakeFs()
+
+        async def drive():
+            chan = _FakeChan()
+            chan.buffered = sg.REPLY_BACKLOG_MAX * 3
+            server = sg.GuestSFTPServer(chan, "/nonexistent", 1, None, stall_timeout=0.3)
+            server._fs = fs
+            with self.assertRaises(sg.asyncssh.SFTPError):
+                await asyncio.wait_for(server.read(sg._GuestFile(1), 0, 100), 30)
+            return chan
+
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):  # it says why on stderr
+            chan = asyncio.run(drive())
+        self.assertIn("took no data", log.getvalue())
+        self.assertTrue(chan.conn.aborted, "stalled client was not disconnected")
+        self.assertEqual(fs.read_sizes, [])
+
+    def test_slow_client_that_keeps_taking_data_is_not_treated_as_stalled(self):
+        # The stall clock restarts on any progress, so only a client that takes
+        # nothing at all trips it -- however slow a live one is.
+        fs = _FakeFs()
+
+        async def drive():
+            chan = _FakeChan()
+            chan.buffered = sg.REPLY_BACKLOG_MAX + 40
+            stall = 0.4
+            server = sg.GuestSFTPServer(chan, "/nonexistent", 1, None, stall_timeout=stall)
+            server._fs = fs
+            read = asyncio.ensure_future(server.read(sg._GuestFile(1), 0, 100))
+            # Drain one byte at a time, each well inside the stall timeout but
+            # for several times its length in total.
+            for _ in range(40):
+                await asyncio.sleep(stall / 8)
+                chan.buffered -= 1
+                self.assertFalse(chan.conn.aborted)
+            await asyncio.wait_for(read, 30)
+            return chan
+
+        chan = asyncio.run(drive())
+        self.assertFalse(chan.conn.aborted)
+        self.assertEqual(fs.read_sizes, [100])
 
     def test_close_after_the_guest_session_died_does_not_raise(self):
         # asyncssh closes open files during teardown before calling exit(); an
