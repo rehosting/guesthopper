@@ -67,6 +67,22 @@ INBOUND_LOW_WATER = 256
 # scp needs); the GuestSFTPServer below implements the v3 operation set.
 SFTP_VERSION = 3
 
+# Most reply data the gateway will hold for one SSH connection before it stops
+# fetching more from the guest (see GuestSFTPServer._await_client). One
+# maximum-size read's worth: a client keeping up never notices, and one that is
+# not can cost at most about twice this.
+REPLY_BACKLOG_MAX = FS_READ_LIMIT
+
+# How long a file-transfer client may take nothing of what it has been sent
+# before its connection is dropped. A client that is connected but frozen would
+# otherwise pin its guest session for good: the gateway's keepalive PINGs keep
+# that session alive on its behalf. Progress resets the clock, so a slow client
+# is not affected, only a stopped one. 0 disables.
+CLIENT_STALL_TIMEOUT_S = 120
+
+# How often a read parked on backpressure rechecks the outbound backlog.
+CLIENT_POLL_S = 0.05
+
 try:
     import asyncssh
     from asyncssh.stream import SSHServerStreamSession
@@ -144,9 +160,10 @@ if asyncssh is not None:
         sits at the prompt.
         """
 
-        def __init__(self, uds_path, vsock_port):
+        def __init__(self, uds_path, vsock_port, stall_timeout=CLIENT_STALL_TIMEOUT_S):
             self._uds_path = uds_path
             self._vsock_port = vsock_port
+            self._stall_timeout = stall_timeout
             self._chan = None
             self._want_pty = False
             self._command = None            # set if the client requested `ssh host CMD`
@@ -178,7 +195,8 @@ if asyncssh is not None:
             self._xfer = SSHServerStreamSession(
                 None,
                 lambda chan: GuestSFTPServer(
-                    chan, self._uds_path, self._vsock_port, self._xfer_write_ok),
+                    chan, self._uds_path, self._vsock_port, self._xfer_write_ok,
+                    self._stall_timeout),
                 sftp_version=SFTP_VERSION,
                 allow_scp=True,
             )
@@ -463,7 +481,7 @@ if asyncssh is not None:
         """Guest statvfs dict (files.rs `statvfs_json`) -> asyncssh SFTPVFSAttrs."""
         return asyncssh.SFTPVFSAttrs(
             v["bsize"], v["frsize"], v["blocks"], v["bfree"], v["bavail"],
-            v["files"], v["ffree"], v["favail"], 0, v["flag"], v["namemax"])
+            v["files"], v["ffree"], v["favail"], v.get("fsid", 0), v["flag"], v["namemax"])
 
     def _setstat_fields(attrs):
         """The subset of an SFTPAttrs the guest can apply (absent ones None)."""
@@ -480,10 +498,12 @@ if asyncssh is not None:
         """asyncssh SFTP server whose filesystem is the *guest's*, reached over
         one vsock ``fs`` session (opened on first use, closed in exit())."""
 
-        def __init__(self, chan, uds_path, vsock_port, write_ok=None):
+        def __init__(self, chan, uds_path, vsock_port, write_ok=None,
+                     stall_timeout=CLIENT_STALL_TIMEOUT_S):
             super().__init__(chan)
             self._uds_path = uds_path
             self._vsock_port = vsock_port
+            self._stall_timeout = stall_timeout
             # Set while the SSH client is keeping up with what we send it (the
             # owning session clears it on pause_writing). None: never wait.
             self._write_ok = write_ok
@@ -503,6 +523,64 @@ if asyncssh is not None:
 
         def format_group(self, gid):
             return "" if gid is None else str(gid)
+
+        def _reply_backlog(self):
+            """Bytes sent to the client that it has not taken yet, as far as
+            this process holds them: asyncssh's per-channel buffer (data beyond
+            the client's SSH window) plus the connection's socket write buffer
+            (data within the window that the kernel has not accepted)."""
+            chan = self.channel
+            backlog = chan.get_write_buffer_size()
+            # asyncssh exposes no handle on its transport, and ignores the
+            # transport's own pause_writing, so look at the buffer directly.
+            # test_scp_e2e's large-window test fails if this ever stops working.
+            transport = getattr(chan.get_connection(), "_transport", None)
+            if transport is not None:
+                backlog += transport.get_write_buffer_size()
+            return backlog
+
+        async def _await_client(self):
+            """Hold a read until the client has taken what it was already sent.
+
+            asyncssh's SFTP server queues each reply without waiting for the
+            client to take it, and a read turns a few-byte request into
+            megabytes of reply: a client that pipelines reads and then stops
+            reading would have this process hold all of it. Requests are served
+            one at a time, so waiting here also stops further ones being read.
+
+            Two things have to be watched. asyncssh's own flow control
+            (pause_writing, mirrored in _write_ok) covers data beyond the
+            client's SSH window -- but the client chooses that window, and a
+            huge one sends everything straight to the socket buffer, which
+            asyncssh does not police. So the total backlog is checked as well.
+
+            A client that takes nothing for _stall_timeout is disconnected, so
+            that its guest session is released rather than held for as long as
+            it cares to stay connected.
+            """
+            loop = asyncio.get_running_loop()
+            lowest = deadline = None
+            while True:
+                # Also how a wait ends when the connection is lost. Don't fetch
+                # data for a client that is gone -- nor for each request it left
+                # queued behind this one, which would keep the guest session
+                # busy (and its slot held) long after the disconnect.
+                if self.channel.is_closing():
+                    raise asyncssh.SFTPConnectionLost("client disconnected")
+                backlog = self._reply_backlog()
+                paused = self._write_ok is not None and not self._write_ok.is_set()
+                if not paused and backlog <= REPLY_BACKLOG_MAX:
+                    return
+                now = loop.time()
+                if lowest is None or backlog < lowest:
+                    lowest = backlog  # the client took something: restart the clock
+                    deadline = now + self._stall_timeout
+                elif self._stall_timeout and now >= deadline:
+                    print(f"ssh_gateway: file-transfer client took no data for "
+                          f"{self._stall_timeout}s; disconnecting it", file=sys.stderr)
+                    self.channel.get_connection().abort()
+                    raise asyncssh.SFTPConnectionLost("client stopped reading")
+                await asyncio.sleep(CLIENT_POLL_S)
 
         @_guest_op
         async def open(self, path, pflags, attrs):
@@ -538,21 +616,7 @@ if asyncssh is not None:
             # treat a short read as "ask again", and well-behaved ones never
             # exceed the limit we advertise anyway.
             size = min(size, FS_READ_LIMIT)
-            # Backpressure. asyncssh's SFTP server queues each reply for the
-            # client without waiting for it to be taken, and a read turns a
-            # few-byte request into megabytes of reply: a client that pipelines
-            # reads and then stops reading would have us hold all of it. So do
-            # not fetch more file data while the client is behind. Requests are
-            # served one at a time, so this also stops further ones being read,
-            # and at most one reply sits beyond asyncssh's buffer limit.
-            if self._write_ok is not None:
-                await self._write_ok.wait()
-            # The wait also ends when the connection is lost. Don't then fetch
-            # data for a client that is gone -- nor for each of the requests it
-            # left queued behind this one, which would keep the guest session
-            # busy (and its slot held) long after the disconnect.
-            if self.channel.is_closing():
-                raise asyncssh.SFTPConnectionLost("client disconnected")
+            await self._await_client()
             return await (await self._guest()).read(file_obj.handle, offset, size)
 
         @_guest_op
@@ -667,9 +731,10 @@ if asyncssh is not None:
                 self.channel.exit(0)
 
     class _GatewayServer(asyncssh.SSHServer):
-        def __init__(self, uds_path, vsock_port):
+        def __init__(self, uds_path, vsock_port, stall_timeout=CLIENT_STALL_TIMEOUT_S):
             self._uds_path = uds_path
             self._vsock_port = vsock_port
+            self._stall_timeout = stall_timeout
 
         def begin_auth(self, username):
             # Returning False means "no authentication required" for this user --
@@ -677,11 +742,12 @@ if asyncssh is not None:
             return False
 
         def session_requested(self):
-            return VsockShellSession(self._uds_path, self._vsock_port)
+            return VsockShellSession(self._uds_path, self._vsock_port, self._stall_timeout)
 
-    async def _serve(listen_host, listen_port, uds_path, vsock_port, host_keys):
+    async def _serve(listen_host, listen_port, uds_path, vsock_port, host_keys,
+                     stall_timeout=CLIENT_STALL_TIMEOUT_S):
         await asyncssh.create_server(
-            lambda: _GatewayServer(uds_path, vsock_port),
+            lambda: _GatewayServer(uds_path, vsock_port, stall_timeout),
             listen_host,
             listen_port,
             server_host_keys=host_keys,
@@ -720,6 +786,10 @@ def main(argv=None):
                         help="Vsock port to connect to (default 12341234).")
     parser.add_argument("--host-key", default=None,
                         help="Path to an SSH host private key. Default: ephemeral.")
+    parser.add_argument("--client-stall-timeout", type=float, default=CLIENT_STALL_TIMEOUT_S,
+                        help="Disconnect a file-transfer client that takes none of the "
+                        "data sent to it for this many seconds, releasing its guest "
+                        f"session (default {CLIENT_STALL_TIMEOUT_S}; 0 disables).")
     args = parser.parse_args(argv)
 
     if asyncssh is None:
@@ -734,7 +804,8 @@ def main(argv=None):
 
     host_keys = _load_host_keys(args.host_key)
     try:
-        asyncio.run(_serve(args.listen_host, args.listen_port, uds_path, args.port, host_keys))
+        asyncio.run(_serve(args.listen_host, args.listen_port, uds_path, args.port, host_keys,
+                           max(args.client_stall_timeout, 0)))
     except KeyboardInterrupt:
         return 0
     return 0
