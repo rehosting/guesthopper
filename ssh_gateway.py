@@ -74,7 +74,7 @@ SFTP_VERSION = 3
 REPLY_BACKLOG_MAX = FS_READ_LIMIT
 
 # How long a file-transfer client may take nothing of what it has been sent
-# before its connection is dropped. A client that is connected but frozen would
+# before its transfer is dropped (its channel only, not the SSH connection). A client that is connected but frozen would
 # otherwise pin its guest session for good: the gateway's keepalive PINGs keep
 # that session alive on its behalf. Progress resets the clock, so a slow client
 # is not affected, only a stopped one. 0 disables.
@@ -190,17 +190,45 @@ if asyncssh is not None:
             # before fetching file data (see GuestSFTPServer.read).
             self._xfer_write_ok = asyncio.Event()
             self._xfer_write_ok.set()
+            self._xfer_ended = False
 
         def _start_file_transfer(self):
             self._xfer = SSHServerStreamSession(
                 None,
                 lambda chan: GuestSFTPServer(
                     chan, self._uds_path, self._vsock_port, self._xfer_write_ok,
-                    self._stall_timeout),
+                    self._stall_timeout, self._drop_stalled_transfer),
                 sftp_version=SFTP_VERSION,
                 allow_scp=True,
             )
             self._xfer.connection_made(self._chan)
+
+        def _end_file_transfer(self, exc):
+            """Tell the SFTP/scp server its client is gone, once. Releases a
+            read parked on backpressure and ends the server's request loop, so
+            it gets on to its teardown (which closes the guest session)."""
+            if self._xfer_ended:
+                return
+            self._xfer_ended = True
+            self._xfer_write_ok.set()
+            self._xfer.connection_lost(exc)
+
+        def _drop_stalled_transfer(self):
+            """Give up on a file-transfer client that has stopped taking data.
+
+            Only this channel: an SSH connection can carry several (a shell and
+            an scp multiplexed over one ControlMaster connection), and one
+            wedged copy must not take the user's shell down with it.
+
+            Closing the channel is not enough on its own. asyncssh finishes
+            closing a channel only when the peer answers, and a frozen peer
+            never will -- so the guest session would stay held. The transfer is
+            therefore ended here, from our side, without waiting for that.
+            abort() also discards the reply data still queued for the channel.
+            """
+            if self._chan is not None:
+                self._chan.abort()
+            self._end_file_transfer(None)
 
         # -- asyncssh callbacks --
         def connection_made(self, chan):
@@ -290,11 +318,7 @@ if asyncssh is not None:
 
         def connection_lost(self, exc):
             if self._xfer is not None:
-                # Release a read parked on backpressure: the client is gone, and
-                # the SFTP server must get on to its teardown (which closes the
-                # guest session) rather than wait for a drain that won't come.
-                self._xfer_write_ok.set()
-                self._xfer.connection_lost(exc)
+                self._end_file_transfer(exc)
                 return
             for t in self._tasks:
                 t.cancel()
@@ -499,11 +523,14 @@ if asyncssh is not None:
         one vsock ``fs`` session (opened on first use, closed in exit())."""
 
         def __init__(self, chan, uds_path, vsock_port, write_ok=None,
-                     stall_timeout=CLIENT_STALL_TIMEOUT_S):
+                     stall_timeout=CLIENT_STALL_TIMEOUT_S, drop_client=None):
             super().__init__(chan)
             self._uds_path = uds_path
             self._vsock_port = vsock_port
             self._stall_timeout = stall_timeout
+            # Called to give up on a stalled client (the owning session's
+            # _drop_stalled_transfer); by default just abort the channel.
+            self._drop_client = drop_client or chan.abort
             # Set while the SSH client is keeping up with what we send it (the
             # owning session clears it on pause_writing). None: never wait.
             self._write_ok = write_ok
@@ -525,19 +552,24 @@ if asyncssh is not None:
             return "" if gid is None else str(gid)
 
         def _reply_backlog(self):
-            """Bytes sent to the client that it has not taken yet, as far as
-            this process holds them: asyncssh's per-channel buffer (data beyond
-            the client's SSH window) plus the connection's socket write buffer
-            (data within the window that the kernel has not accepted)."""
+            """Reply data this process is still holding for the client, as
+            ``(channel, transport)`` byte counts.
+
+            ``channel`` is asyncssh's per-channel buffer: data beyond the
+            client's SSH window. ``transport`` is the connection's socket write
+            buffer: data within the window that the kernel has not accepted
+            yet. The second is shared by every channel on the connection.
+
+            Not counted: packets asyncssh defers while a key re-exchange is in
+            progress. A rekey lasts milliseconds, so that is a read or two.
+            """
             chan = self.channel
-            backlog = chan.get_write_buffer_size()
             # asyncssh exposes no handle on its transport, and ignores the
             # transport's own pause_writing, so look at the buffer directly.
             # test_scp_e2e's large-window test fails if this ever stops working.
             transport = getattr(chan.get_connection(), "_transport", None)
-            if transport is not None:
-                backlog += transport.get_write_buffer_size()
-            return backlog
+            return (chan.get_write_buffer_size(),
+                    transport.get_write_buffer_size() if transport is not None else 0)
 
         async def _await_client(self):
             """Hold a read until the client has taken what it was already sent.
@@ -552,14 +584,19 @@ if asyncssh is not None:
             (pause_writing, mirrored in _write_ok) covers data beyond the
             client's SSH window -- but the client chooses that window, and a
             huge one sends everything straight to the socket buffer, which
-            asyncssh does not police. So the total backlog is checked as well.
+            asyncssh does not police. So the amount actually held is checked
+            too. The socket buffer belongs to the whole connection, so another
+            channel's output can make a read wait here; that is intended, since
+            the memory being bounded is the connection's.
 
-            A client that takes nothing for _stall_timeout is disconnected, so
-            that its guest session is released rather than held for as long as
-            it cares to stay connected.
+            A client that takes nothing for _stall_timeout is dropped, so that
+            its guest session is released rather than held for as long as it
+            cares to stay connected. "Takes something" means either buffer was
+            smaller than at the previous look -- not a new all-time low, which
+            other traffic on the connection could keep out of reach.
             """
             loop = asyncio.get_running_loop()
-            lowest = deadline = None
+            previous = deadline = None
             while True:
                 # Also how a wait ends when the connection is lost. Don't fetch
                 # data for a client that is gone -- nor for each request it left
@@ -567,19 +604,19 @@ if asyncssh is not None:
                 # busy (and its slot held) long after the disconnect.
                 if self.channel.is_closing():
                     raise asyncssh.SFTPConnectionLost("client disconnected")
-                backlog = self._reply_backlog()
+                held = self._reply_backlog()
                 paused = self._write_ok is not None and not self._write_ok.is_set()
-                if not paused and backlog <= REPLY_BACKLOG_MAX:
+                if not paused and sum(held) <= REPLY_BACKLOG_MAX:
                     return
                 now = loop.time()
-                if lowest is None or backlog < lowest:
-                    lowest = backlog  # the client took something: restart the clock
-                    deadline = now + self._stall_timeout
+                if previous is None or held[0] < previous[0] or held[1] < previous[1]:
+                    deadline = now + self._stall_timeout  # progress: restart the clock
                 elif self._stall_timeout and now >= deadline:
                     print(f"ssh_gateway: file-transfer client took no data for "
-                          f"{self._stall_timeout}s; disconnecting it", file=sys.stderr)
-                    self.channel.get_connection().abort()
+                          f"{self._stall_timeout}s; dropping the transfer", file=sys.stderr)
+                    self._drop_client()
                     raise asyncssh.SFTPConnectionLost("client stopped reading")
+                previous = held
                 await asyncio.sleep(CLIENT_POLL_S)
 
         @_guest_op
@@ -787,7 +824,7 @@ def main(argv=None):
     parser.add_argument("--host-key", default=None,
                         help="Path to an SSH host private key. Default: ephemeral.")
     parser.add_argument("--client-stall-timeout", type=float, default=CLIENT_STALL_TIMEOUT_S,
-                        help="Disconnect a file-transfer client that takes none of the "
+                        help="Drop a file transfer whose client takes none of the "
                         "data sent to it for this many seconds, releasing its guest "
                         f"session (default {CLIENT_STALL_TIMEOUT_S}; 0 disables).")
     args = parser.parse_args(argv)
