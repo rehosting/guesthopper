@@ -109,7 +109,7 @@ class _FakeConn:
     def __init__(self, chan):
         self._chan = chan
         self._transport = _FakeTransport()
-        self.aborted = False
+        self.aborted = False   # the whole SSH connection torn down
 
     def abort(self):
         self.aborted = True
@@ -121,11 +121,16 @@ class _FakeChan:
 
     def __init__(self):
         self.closing = False
+        self.aborted = False       # this channel alone torn down
         self.buffered = 0          # bytes beyond the client's SSH window
         self.conn = _FakeConn(self)
 
     def is_closing(self):
         return self.closing
+
+    def abort(self):
+        self.aborted = True
+        self.closing = True
 
     def get_write_buffer_size(self):
         return self.buffered
@@ -276,7 +281,9 @@ class GuestSFTPServerTests(unittest.TestCase):
         with contextlib.redirect_stderr(log):  # it says why on stderr
             chan = asyncio.run(drive())
         self.assertIn("took no data", log.getvalue())
-        self.assertTrue(chan.conn.aborted, "stalled client was not disconnected")
+        self.assertTrue(chan.aborted, "stalled transfer was not dropped")
+        # Its channel only. The SSH connection may be carrying a shell too.
+        self.assertFalse(chan.conn.aborted, "the whole connection was torn down")
         self.assertEqual(fs.read_sizes, [])
 
     def test_slow_client_that_keeps_taking_data_is_not_treated_as_stalled(self):
@@ -296,12 +303,40 @@ class GuestSFTPServerTests(unittest.TestCase):
             for _ in range(40):
                 await asyncio.sleep(stall / 8)
                 chan.buffered -= 1
-                self.assertFalse(chan.conn.aborted)
+                self.assertFalse(chan.aborted)
             await asyncio.wait_for(read, 30)
             return chan
 
         chan = asyncio.run(drive())
-        self.assertFalse(chan.conn.aborted)
+        self.assertFalse(chan.aborted)
+        self.assertEqual(fs.read_sizes, [100])
+
+    def test_progress_counts_even_when_other_traffic_keeps_the_backlog_up(self):
+        # The socket buffer is shared by every channel on the connection. A
+        # shell on the same connection can keep refilling it, so the total
+        # never reaches a new low even though the client is plainly reading:
+        # each time it drains a little, that must count as progress.
+        fs = _FakeFs()
+
+        async def drive():
+            chan = _FakeChan()
+            transport = chan.conn._transport
+            high = sg.REPLY_BACKLOG_MAX * 2
+            transport.buffered = high
+            stall = 0.4
+            server = sg.GuestSFTPServer(chan, "/nonexistent", 1, None, stall_timeout=stall)
+            server._fs = fs
+            read = asyncio.ensure_future(server.read(sg._GuestFile(1), 0, 100))
+            # Saw-tooth for several stall timeouts: drained a bit by the
+            # client, topped back up by the other channel. Never below `high - 1000`.
+            for i in range(60):
+                await asyncio.sleep(stall / 10)
+                transport.buffered = high - 1000 if i % 2 else high
+                self.assertFalse(chan.aborted, "live connection was treated as stalled")
+            transport.buffered = 0
+            await asyncio.wait_for(read, 30)
+
+        asyncio.run(drive())
         self.assertEqual(fs.read_sizes, [100])
 
     def test_close_after_the_guest_session_died_does_not_raise(self):

@@ -392,6 +392,72 @@ asyncio.run(main())
         self.scp(src, self.remote(dst))
         self.assertTrue(filecmp.cmp(src, dst, shallow=False))
 
+    def test_stalled_copy_does_not_take_down_a_shell_on_the_same_connection(self):
+        # OpenSSH can multiplex sessions over one connection (ControlMaster).
+        # When a copy on such a connection wedges and is dropped, only its
+        # channel may go: the user's shell on the same connection must live.
+        import signal
+
+        ctl = os.path.join(self.tmp, "mux")
+        mux = ["-o", f"ControlPath={ctl}"]
+        target = "root@127.0.0.1"
+        master = subprocess.Popen(
+            ["ssh", *SSH_OPTS, "-p", str(self.port), "-o", "ControlMaster=yes", *mux, "-N", target],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(master.wait)
+        self.addCleanup(master.kill)
+        _wait_for(lambda: os.path.exists(ctl), "the ControlMaster socket")
+
+        # A shell on the shared connection that proves it is alive once a second.
+        ticks = os.path.join(self.tmp, "ticks.log")
+        with open(ticks, "wb") as out:
+            shell = subprocess.Popen(
+                ["ssh", *SSH_OPTS, *mux, target, "i=0; while :; do i=$((i+1)); echo tick $i; sleep 1; done"],
+                stdout=out, stderr=subprocess.DEVNULL)
+        self.addCleanup(shell.wait)
+        self.addCleanup(shell.kill)
+
+        def tick_count():
+            with open(ticks, "rb") as f:
+                return f.read().count(b"tick")
+
+        _wait_for(lambda: tick_count() >= 2, "the shell to start ticking")
+
+        # A download over the same connection, frozen part-way (scp and the
+        # ssh it runs: its whole process group).
+        big = os.path.join(self.guest, "sparse-mux.bin")
+        with open(big, "wb") as f:
+            f.truncate(1024 * 1024 * 1024)
+        dst = os.path.join(self.host, "mux-download.bin")
+        before = self._agent_sessions_ended()
+        copy = subprocess.Popen(
+            ["scp", *SSH_OPTS, *mux, self.remote(big), dst],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+        def stop_copy(sig):
+            try:
+                os.killpg(copy.pid, sig)
+            except ProcessLookupError:
+                pass
+
+        self.addCleanup(copy.wait)
+        self.addCleanup(stop_copy, signal.SIGKILL)
+        _wait_for(lambda: os.path.exists(dst) and os.path.getsize(dst) > 0, "the copy to start")
+        stop_copy(signal.SIGSTOP)
+
+        # The gateway gives up on the copy and releases its guest session...
+        _wait_for(lambda: self._agent_sessions_ended() > before,
+                  "the stalled copy's guest session to be released")
+        # ...and the shell on the same connection keeps going.
+        seen = tick_count()
+        _wait_for(lambda: tick_count() >= seen + 3, "the shell to keep ticking after the copy was dropped")
+        self.assertIsNone(shell.poll(), "the shell died with the stalled copy")
+        self.assertIsNone(master.poll(), "the shared connection was torn down")
+        # New sessions over it still work too.
+        r = subprocess.run(["ssh", *SSH_OPTS, *mux, target, "echo still-here"],
+                           capture_output=True, text=True, timeout=SOON)
+        self.assertEqual(r.stdout, "still-here\n", r.stderr)
+
     def test_oversized_read_request_is_answered_short_not_buffered(self):
         # A raw SFTP READ may carry any u32 length. The gateway must answer
         # with a bounded chunk rather than fetch (and hold) the whole range.

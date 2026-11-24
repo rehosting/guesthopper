@@ -20,7 +20,7 @@ Things to know:
 * An `ssh host "scp ..."` exec is always answered by the gateway's own scp implementation, even if the firmware ships an `scp`. Only the transfer forms (`scp -t` / `scp -f`, i.e. what `scp -O` sends) are understood; to run the guest's own binary for anything else, go through a shell (`ssh host "sh -c 'scp ...'"`).
 * Only regular files and seekable devices transfer. FIFOs, ttys and sockets can be listed and stat'ed but not read or written.
 * A single read is capped at 4 MiB (the limit advertised to SFTP clients); clients simply ask again for the rest.
-* A download client that takes none of the data sent to it for two minutes is disconnected, so that a frozen client cannot hold a guest session open indefinitely. A slow client is unaffected: any progress restarts the clock. `--client-stall-timeout` changes the limit (0 disables it).
+* A download whose client takes none of the data sent to it for two minutes is dropped, so that a frozen client cannot hold a guest session open indefinitely. Only that transfer's channel is closed: a shell sharing the same SSH connection (`ControlMaster`) carries on. A slow client is unaffected, since any progress restarts the clock. `--client-stall-timeout` changes the limit (0 disables it).
 
 ## Testing
 
