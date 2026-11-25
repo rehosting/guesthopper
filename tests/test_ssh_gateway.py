@@ -170,7 +170,6 @@ class _FakeFs:
 
 
 @requires(asyncssh=sg.asyncssh is not None)
-@requires(asyncssh=sg.asyncssh is not None)
 class GuestFileTests(unittest.TestCase):
     def test_sparse_probe_reports_one_run_of_data(self):
         # asyncssh's ranges extension seeks the file object directly; the
@@ -184,12 +183,25 @@ class GuestFileTests(unittest.TestCase):
         self.assertEqual(asyncio.run(ranges(0, 5000)), [(0, 5000)])
         self.assertEqual(asyncio.run(ranges(4096, 100)), [(4096, 100)])
         self.assertEqual(asyncio.run(ranges(0, 0)), [])
+        # The largest range the wire format can carry is still one run.
+        top = 2 ** 64 - 1
+        self.assertEqual(asyncio.run(ranges(top, top)), [(top, top)])
+
+    def test_attrs_that_do_not_fit_sftp_v3_are_clamped_not_fatal(self):
+        # One such file must not break stat, or the listing of its directory.
+        for raw, want in ((-5, 0), (2 ** 33, 0xFFFFFFFF), (1400000000, 1400000000)):
+            attrs = sg._to_sftp_attrs({"mode": 0o100644, "size": 1, "uid": raw,
+                                       "gid": raw, "atime": raw, "mtime": raw})
+            self.assertEqual((attrs.uid, attrs.gid, attrs.atime, attrs.mtime), (want,) * 4)
+            attrs.encode(3)
+        self.assertIsNone(sg._to_sftp_attrs({"mode": 0o100644}).mtime)
 
     def test_other_seeks_are_refused(self):
         with self.assertRaises(OSError):
             sg._GuestFile(1).seek(10)
 
 
+@requires(asyncssh=sg.asyncssh is not None)
 class GuestSFTPServerTests(unittest.TestCase):
     """The SFTP bridge's own logic, with the guest faked out."""
 

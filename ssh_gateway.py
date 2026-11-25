@@ -487,6 +487,15 @@ if asyncssh is not None:
                 return ftype
         return asyncssh.FILEXFER_TYPE_UNKNOWN
 
+    def _u32(value):
+        """Clamp a guest value into an SFTP v3 uint32 field.
+
+        The protocol has no room for a time before 1970 or after 2106, and
+        asyncssh raises while encoding one -- which fails not just that file's
+        stat but the listing of the whole directory it sits in.
+        """
+        return None if value is None else min(max(int(value), 0), 0xFFFFFFFF)
+
     def _to_sftp_attrs(attrs):
         """Guest stat dict (files.rs `attrs`) -> asyncssh SFTPAttrs."""
         if not attrs:
@@ -495,11 +504,11 @@ if asyncssh is not None:
         return asyncssh.SFTPAttrs(
             type=_filetype(mode),
             size=attrs.get("size"),
-            uid=attrs.get("uid"),
-            gid=attrs.get("gid"),
+            uid=_u32(attrs.get("uid")),
+            gid=_u32(attrs.get("gid")),
             permissions=mode,
-            atime=attrs.get("atime"),
-            mtime=attrs.get("mtime"),
+            atime=_u32(attrs.get("atime")),
+            mtime=_u32(attrs.get("mtime")),
             nlink=attrs.get("nlink"),
         )
 
@@ -513,6 +522,10 @@ if asyncssh is not None:
         """The subset of an SFTPAttrs the guest can apply (absent ones None)."""
         return dict(size=attrs.size, uid=attrs.uid, gid=attrs.gid,
                     mode=attrs.permissions, atime=attrs.atime, mtime=attrs.mtime)
+
+    # Past the end of any range an SFTP client can name (offset + length, both
+    # uint64), so the one reported run of data always covers the whole request.
+    _NO_HOLE = 1 << 65
 
     class _GuestFile:
         """An open guest file, identified by the agent's handle for it."""
@@ -535,7 +548,7 @@ if asyncssh is not None:
             if whence == os.SEEK_DATA:
                 return offset
             if whence == os.SEEK_HOLE:
-                return sys.maxsize
+                return _NO_HOLE
             raise OSError(errno.EINVAL, "guest files are addressed by offset")
 
     class GuestSFTPServer(asyncssh.SFTPServer):

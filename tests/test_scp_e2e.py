@@ -471,6 +471,11 @@ asyncio.run(main())
         with open(sparse, "wb") as f:
             f.seek(200 * 1024)
             f.write(b"tail")
+        empty = os.path.join(self.guest, "py.empty")
+        open(empty, "wb").close()
+        # A timestamp SFTP v3 cannot carry (before 1970) must not break the
+        # listing of the directory the file is in.
+        os.utime(empty, (-5, -5))
 
         async def drive():
             async with asyncssh.connect("127.0.0.1", self.port, username="root",
@@ -479,6 +484,11 @@ asyncio.run(main())
                     await sftp.put(src, dst)
                     await sftp.get(dst, os.path.join(self.host, "py.sftp"))
                     await sftp.get(sparse, os.path.join(self.host, "py.sparse"))
+                    await sftp.get(empty, os.path.join(self.host, "py.empty"))
+                    await sftp.copy(dst, dst + ".copy")  # server-side copy-data
+                    names = await sftp.listdir(self.guest)
+                    self.assertIn("py.empty", names)
+                    self.assertEqual((await sftp.stat(empty)).mtime, 0)
                     async with sftp.open(dst, "rb") as f:
                         await f.seek(1000)
                         middle = await f.read(50)
@@ -488,7 +498,8 @@ asyncio.run(main())
 
         middle = asyncio.run(asyncio.wait_for(drive(), SOON))
         self.assertEqual(middle, data[1000:1050])
-        for name in (dst, dst + ".scp"):
+        self.assertEqual(os.path.getsize(os.path.join(self.host, "py.empty")), 0)
+        for name in (dst, dst + ".scp", dst + ".copy"):
             with open(name, "rb") as f:
                 self.assertEqual(f.read(), data, name)
         for name in ("py.sftp", "py.scp"):
