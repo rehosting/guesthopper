@@ -33,7 +33,9 @@ asyncssh; the SSH server itself needs it at run time.
 import argparse
 import asyncio
 import functools
+import errno
 import json
+import os
 import stat
 import sys
 
@@ -517,6 +519,24 @@ if asyncssh is not None:
 
         def __init__(self, handle):
             self.handle = handle
+
+        def seek(self, offset, whence=os.SEEK_SET):
+            """Answer asyncssh's sparse-file probe, which bypasses the server.
+
+            asyncssh's own SFTP client asks an asyncssh server which ranges of
+            a file hold data (``ranges@asyncssh.com``) before every download,
+            and the server answers by calling ``seek(SEEK_DATA / SEEK_HOLE)``
+            on the open file object directly instead of through an SFTPServer
+            method. Report the file as one run of data with no holes: the
+            client then reads the whole range, exactly as it does against a
+            server without the extension. (Real holes are simply read as the
+            zeroes they are.)
+            """
+            if whence == os.SEEK_DATA:
+                return offset
+            if whence == os.SEEK_HOLE:
+                return sys.maxsize
+            raise OSError(errno.EINVAL, "guest files are addressed by offset")
 
     class GuestSFTPServer(asyncssh.SFTPServer):
         """asyncssh SFTP server whose filesystem is the *guest's*, reached over
