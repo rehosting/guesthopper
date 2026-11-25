@@ -170,6 +170,26 @@ class _FakeFs:
 
 
 @requires(asyncssh=sg.asyncssh is not None)
+@requires(asyncssh=sg.asyncssh is not None)
+class GuestFileTests(unittest.TestCase):
+    def test_sparse_probe_reports_one_run_of_data(self):
+        # asyncssh's ranges extension seeks the file object directly; the
+        # answer must come out as the single range that was asked about.
+        import asyncssh.sftp
+
+        async def ranges(offset, length):
+            f = sg._GuestFile(1)
+            return [r async for r in asyncssh.sftp._request_ranges(f, offset, length)]
+
+        self.assertEqual(asyncio.run(ranges(0, 5000)), [(0, 5000)])
+        self.assertEqual(asyncio.run(ranges(4096, 100)), [(4096, 100)])
+        self.assertEqual(asyncio.run(ranges(0, 0)), [])
+
+    def test_other_seeks_are_refused(self):
+        with self.assertRaises(OSError):
+            sg._GuestFile(1).seek(10)
+
+
 class GuestSFTPServerTests(unittest.TestCase):
     """The SFTP bridge's own logic, with the guest faked out."""
 

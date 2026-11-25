@@ -458,6 +458,44 @@ asyncio.run(main())
                            capture_output=True, text=True, timeout=SOON)
         self.assertEqual(r.stdout, "still-here\n", r.stderr)
 
+    def test_asyncssh_client_roundtrip_over_sftp_and_scp(self):
+        # asyncssh's own client talks to the gateway differently from OpenSSH:
+        # it negotiates asyncssh-only extensions (a sparse-file range query
+        # before every download) that never go through GuestSFTPServer.
+        import asyncio
+
+        data = os.urandom(300 * 1024 + 77)
+        src = self.host_file("py.bin", data)
+        dst = os.path.join(self.guest, "py.bin")
+        sparse = os.path.join(self.guest, "py.sparse")
+        with open(sparse, "wb") as f:
+            f.seek(200 * 1024)
+            f.write(b"tail")
+
+        async def drive():
+            async with asyncssh.connect("127.0.0.1", self.port, username="root",
+                                        known_hosts=None) as conn:
+                async with conn.start_sftp_client() as sftp:
+                    await sftp.put(src, dst)
+                    await sftp.get(dst, os.path.join(self.host, "py.sftp"))
+                    await sftp.get(sparse, os.path.join(self.host, "py.sparse"))
+                    async with sftp.open(dst, "rb") as f:
+                        await f.seek(1000)
+                        middle = await f.read(50)
+                await asyncssh.scp(src, (conn, dst + ".scp"))
+                await asyncssh.scp((conn, dst + ".scp"), os.path.join(self.host, "py.scp"))
+                return middle
+
+        middle = asyncio.run(asyncio.wait_for(drive(), SOON))
+        self.assertEqual(middle, data[1000:1050])
+        for name in (dst, dst + ".scp"):
+            with open(name, "rb") as f:
+                self.assertEqual(f.read(), data, name)
+        for name in ("py.sftp", "py.scp"):
+            self.assertTrue(filecmp.cmp(src, os.path.join(self.host, name), shallow=False), name)
+        with open(os.path.join(self.host, "py.sparse"), "rb") as f:
+            self.assertEqual(f.read(), b"\0" * (200 * 1024) + b"tail")
+
     def test_oversized_read_request_is_answered_short_not_buffered(self):
         # A raw SFTP READ may carry any u32 length. The gateway must answer
         # with a bounded chunk rather than fetch (and hold) the whole range.
